@@ -55,6 +55,19 @@ Notes:
 - Omit a key to accept its default.
 - Legacy booleans such as `experimental_use_exec_command_tool`, `experimental_use_unified_exec_tool`, `include_apply_patch_tool`, and similar `experimental_use_*` keys are deprecated; setting the corresponding `[features].<key>` avoids repeated warnings.
 
+## Web search (Tavily)
+
+Enable Tavily-backed web search by setting the feature flag and adding your API key:
+
+```toml
+[features]
+web_search_request = true
+
+tavily_api_key = "tvly-..."
+```
+
+When enabled, the model can call the `web_search` tool. It defaults to 10 results unless the tool call overrides `limit`.
+
 ## Model selection
 
 ### model
@@ -361,6 +374,8 @@ view_image = false  # disable image uploads (they're enabled by default)
 ```
 
 The `view_image` toggle is useful when you want to include screenshots or diagrams from your repo without pasting them manually. Codex still respects sandboxing: it can only attach files inside the workspace roots you allow.
+
+For local model providers (for example, Ollama), enabling `web_search_request` and configuring `tavily_api_key` allows Codex to run a web search automatically for prompts that mention current events or news, so those models get fresh results even if they don't call tools on their own.
 
 ### approval_presets
 
@@ -1002,6 +1017,7 @@ Valid values:
 | `model_provider`                                 | string                                                            | Provider id from `model_providers` (default: `openai`).                                                                         |
 | `model_context_window`                           | number                                                            | Context window tokens.                                                                                                          |
 | `tool_output_token_limit`                        | number                                                            | Token budget for stored function/tool outputs in history (default: 2,560 tokens).                                               |
+| `tavily_api_key`                                 | string                                                            | API key for Tavily web search (enables `web_search` when `features.web_search_request` is true).                                 |
 | `approval_policy`                                | `untrusted` \| `on-failure` \| `on-request` \| `never`            | When to prompt for approval.                                                                                                    |
 | `sandbox_mode`                                   | `read-only` \| `workspace-write` \| `danger-full-access`          | OS sandbox policy.                                                                                                              |
 | `sandbox_workspace_write.writable_roots`         | array<string>                                                     | Extra writable roots in workspace‑write.                                                                                        |

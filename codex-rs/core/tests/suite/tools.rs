@@ -92,6 +92,71 @@ async fn custom_tool_unknown_returns_custom_output_error() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_search_returns_results_for_current_event_fact() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    use pretty_assertions::assert_eq;
+
+    let api_key = std::env::var("TAVILY_API_KEY")
+        .context("TAVILY_API_KEY must be set to run Tavily web search tests")?;
+    let api_key = api_key.trim().to_string();
+    assert!(!api_key.is_empty(), "TAVILY_API_KEY must not be empty");
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(move |config| {
+        config.tavily_api_key = Some(api_key);
+        config.features.enable(Feature::WebSearchRequest);
+    });
+    let test = builder.build(&server).await?;
+
+    let call_id = "web-search-1";
+    let query = "search the internet and tell me one current event fact";
+    let args = json!({ "query": query });
+
+    let mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(call_id, "web_search", &serde_json::to_string(&args)?),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    test.submit_turn("please search the web").await?;
+
+    let output = mock
+        .function_call_output_text(call_id)
+        .context("expected web_search function call output")?;
+    if output.trim().is_empty() {
+        anyhow::bail!("web_search output was empty");
+    }
+    let payload: Value =
+        serde_json::from_str(&output).context(format!("invalid web_search output: {output}"))?;
+
+    assert_eq!(payload["query"], query);
+    assert_eq!(payload["limit"], 10);
+
+    let results = payload["results"]
+        .as_array()
+        .context("expected results array")?;
+    assert!(!results.is_empty(), "expected at least one result");
+
+    let first_url = results[0]["url"].as_str().unwrap_or_default();
+    assert!(
+        !first_url.is_empty(),
+        "expected first result to include a URL"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shell_escalated_permissions_rejected_then_ok() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

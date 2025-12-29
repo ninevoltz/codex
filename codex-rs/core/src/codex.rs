@@ -23,6 +23,8 @@ use crate::parse_turn_item;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::handle_non_tool_response_item;
 use crate::stream_events_utils::handle_output_item_done;
+use crate::tavily::TavilyRequest;
+use crate::tavily::search_tavily;
 use crate::terminal;
 use crate::truncate::TruncationPolicy;
 use crate::user_notification::UserNotifier;
@@ -118,6 +120,8 @@ use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnDiffEvent;
 use crate::protocol::WarningEvent;
+use crate::protocol::WebSearchBeginEvent;
+use crate::protocol::WebSearchEndEvent;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::RolloutRecorderParams;
 use crate::rollout::map_session_init_error;
@@ -153,6 +157,7 @@ use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::WebSearchAction;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::InitialHistory;
@@ -2188,6 +2193,153 @@ fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
         .collect()
 }
 
+fn web_search_query_from_input(input: &[UserInput]) -> Option<String> {
+    let mut parts = Vec::new();
+    for item in input {
+        if let UserInput::Text { text } = item {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed);
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    let query = parts.join(" ");
+    let lowered = query.to_ascii_lowercase();
+    let keywords = [
+        "current event",
+        "current events",
+        "news",
+        "latest",
+        "today",
+        "search the web",
+        "search the internet",
+        "web search",
+        "web_search",
+        "web_search tool",
+        "use the web_search tool",
+        "use web_search",
+        "search online",
+        "breaking news",
+        "recent",
+        "recently",
+        "yesterday",
+        "this week",
+        "what happened",
+        "who shot",
+        "who killed",
+        "who was shot",
+        "who was killed",
+        "was shot",
+        "was killed",
+        "shooting",
+        "assassination",
+        "assassinated",
+        "attack",
+        "bombing",
+    ];
+
+    if keywords.iter().any(|keyword| lowered.contains(keyword)) {
+        Some(query)
+    } else {
+        None
+    }
+}
+
+async fn maybe_inject_web_search_for_local_models(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    query: Option<String>,
+) {
+    if !turn_context.tools_config.web_search_request {
+        return;
+    }
+
+    let Some(query) = query else {
+        return;
+    };
+
+    let config = turn_context.client.config();
+    if config.model_provider_id.starts_with("openai") {
+        return;
+    }
+
+    let Some(api_key) = config
+        .tavily_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+
+    let call_id = format!("web-search-auto-{}", turn_context.sub_id);
+    sess.send_event(
+        turn_context,
+        EventMsg::WebSearchBegin(WebSearchBeginEvent {
+            call_id: call_id.clone(),
+        }),
+    )
+    .await;
+
+    let results = match search_tavily(TavilyRequest {
+        api_key: api_key.to_string(),
+        query: query.clone(),
+        limit: 10,
+    })
+    .await
+    {
+        Ok(results) => results,
+        Err(err) => {
+            warn!("auto web_search failed: {err}");
+            sess.send_event(
+                turn_context,
+                EventMsg::WebSearchEnd(WebSearchEndEvent { call_id, query }),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let web_search_call = ResponseItem::WebSearchCall {
+        id: Some(call_id.clone()),
+        status: Some("completed".to_string()),
+        action: WebSearchAction::Search {
+            query: Some(query.clone()),
+        },
+    };
+    sess.record_response_item_and_emit_turn_item(turn_context, web_search_call)
+        .await;
+
+    sess.send_event(
+        turn_context,
+        EventMsg::WebSearchEnd(WebSearchEndEvent {
+            call_id,
+            query: query.clone(),
+        }),
+    )
+    .await;
+
+    let payload = serde_json::json!({
+        "query": query,
+        "limit": 10,
+        "results": results,
+        "source": "tavily",
+    });
+    let content = format!("Web search results (Tavily). Use these results to answer:\n{payload}");
+    let web_search_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText { text: content }],
+    };
+    sess.record_conversation_items(turn_context, std::slice::from_ref(&web_search_message))
+        .await;
+}
+
 /// Takes a user message as input and runs a loop where, at each turn, the model
 /// replies with either:
 ///
@@ -2211,6 +2363,8 @@ pub(crate) async fn run_task(
     if input.is_empty() {
         return None;
     }
+
+    let auto_web_search_query = web_search_query_from_input(&input);
 
     let auto_compact_limit = turn_context
         .client
@@ -2251,6 +2405,8 @@ pub(crate) async fn run_task(
         sess.record_conversation_items(&turn_context, &skill_items)
             .await;
     }
+
+    maybe_inject_web_search_for_local_models(&sess, &turn_context, auto_web_search_query).await;
 
     sess.maybe_start_ghost_snapshot(Arc::clone(&turn_context), cancellation_token.child_token())
         .await;
@@ -2767,6 +2923,7 @@ mod tests {
     use codex_app_server_protocol::AuthMode;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
+    use codex_protocol::user_input::UserInput;
     use std::path::Path;
     use std::time::Duration;
     use tokio::time::sleep;
@@ -2788,6 +2945,49 @@ mod tests {
         let reconstructed = session.reconstruct_history_from_rollout(&turn_context, &rollout_items);
 
         assert_eq!(expected, reconstructed);
+    }
+
+    #[test]
+    fn web_search_query_from_input_detects_current_events() {
+        let input = vec![UserInput::Text {
+            text: "What is one current event today?".to_string(),
+        }];
+
+        let query = web_search_query_from_input(&input);
+        assert_eq!(query, Some("What is one current event today?".to_string()));
+    }
+
+    #[test]
+    fn web_search_query_from_input_detects_shooting_questions() {
+        let input = vec![UserInput::Text {
+            text: "Who shot Charlie Kirk?".to_string(),
+        }];
+
+        let query = web_search_query_from_input(&input);
+        assert_eq!(query, Some("Who shot Charlie Kirk?".to_string()));
+    }
+
+    #[test]
+    fn web_search_query_from_input_detects_explicit_tool_request() {
+        let input = vec![UserInput::Text {
+            text: "Use the web_search tool to look up: who is the president of the united states in 2025.".to_string(),
+        }];
+
+        let query = web_search_query_from_input(&input);
+        assert_eq!(
+            query,
+            Some("Use the web_search tool to look up: who is the president of the united states in 2025.".to_string())
+        );
+    }
+
+    #[test]
+    fn web_search_query_from_input_skips_unrelated_prompts() {
+        let input = vec![UserInput::Text {
+            text: "Explain ownership in Rust.".to_string(),
+        }];
+
+        let query = web_search_query_from_input(&input);
+        assert_eq!(query, None);
     }
 
     #[tokio::test]

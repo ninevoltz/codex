@@ -4,6 +4,7 @@ use crate::features::Feature;
 use crate::features::Features;
 use crate::models_manager::model_family::ModelFamily;
 use crate::tools::handlers::PLAN_TOOL;
+use crate::tools::handlers::WebSearchHandler;
 use crate::tools::handlers::apply_patch::create_apply_patch_freeform_tool;
 use crate::tools::handlers::apply_patch::create_apply_patch_json_tool;
 use crate::tools::registry::ToolRegistryBuilder;
@@ -411,6 +412,33 @@ fn create_view_image_tool() -> ToolSpec {
         parameters: JsonSchema::Object {
             properties,
             required: Some(vec!["path".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_web_search_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "query".to_string(),
+        JsonSchema::String {
+            description: Some("Search query.".to_string()),
+        },
+    );
+    properties.insert(
+        "limit".to_string(),
+        JsonSchema::Number {
+            description: Some("Maximum number of results to return (default: 10).".to_string()),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "web_search".to_string(),
+        description: "Search the web via Tavily and return structured results.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["query".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -1094,7 +1122,9 @@ pub(crate) fn build_specs(
     }
 
     if config.web_search_request {
-        builder.push_spec(ToolSpec::WebSearch {});
+        let web_search_handler = Arc::new(WebSearchHandler);
+        builder.push_spec(create_web_search_tool());
+        builder.register_handler("web_search", web_search_handler);
     }
 
     if config.include_view_image_tool {
@@ -1137,7 +1167,6 @@ mod tests {
         match tool {
             ToolSpec::Function(ResponsesApiTool { name, .. }) => name,
             ToolSpec::LocalShell {} => "local_shell",
-            ToolSpec::WebSearch {} => "web_search",
             ToolSpec::Freeform(FreeformTool { name, .. }) => name,
         }
     }
@@ -1215,7 +1244,7 @@ mod tests {
             ToolSpec::Function(ResponsesApiTool { parameters, .. }) => {
                 strip_descriptions_schema(parameters);
             }
-            ToolSpec::Freeform(_) | ToolSpec::LocalShell {} | ToolSpec::WebSearch {} => {}
+            ToolSpec::Freeform(_) | ToolSpec::LocalShell {} => {}
         }
     }
 
@@ -1259,7 +1288,7 @@ mod tests {
             create_read_mcp_resource_tool(),
             PLAN_TOOL.clone(),
             create_apply_patch_freeform_tool(),
-            ToolSpec::WebSearch {},
+            create_web_search_tool(),
             create_view_image_tool(),
         ] {
             expected.insert(tool_name(&spec).to_string(), spec);

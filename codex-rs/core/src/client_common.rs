@@ -22,6 +22,7 @@ pub const REVIEW_PROMPT: &str = include_str!("../review_prompt.md");
 pub const REVIEW_EXIT_SUCCESS_TMPL: &str = include_str!("../templates/review/exit_success.xml");
 pub const REVIEW_EXIT_INTERRUPTED_TMPL: &str =
     include_str!("../templates/review/exit_interrupted.xml");
+const WEB_SEARCH_TOOL_INSTRUCTIONS: &str = "If you need up-to-date or factual information beyond what is in the conversation, use the web_search tool and cite the results instead of guessing.";
 
 /// API request payload for a single model turn
 #[derive(Default, Debug, Clone)]
@@ -58,14 +59,29 @@ impl Prompt {
             ToolSpec::Freeform(f) => f.name == "apply_patch",
             _ => false,
         });
-        if self.base_instructions_override.is_none()
-            && model.needs_special_apply_patch_instructions
-            && !is_apply_patch_tool_present
-        {
-            Cow::Owned(format!("{base}\n{APPLY_PATCH_TOOL_INSTRUCTIONS}"))
-        } else {
-            Cow::Borrowed(base)
+        let is_web_search_tool_present = self.tools.iter().any(|tool| match tool {
+            ToolSpec::Function(f) => f.name == "web_search",
+            ToolSpec::Freeform(f) => f.name == "web_search",
+            _ => false,
+        });
+        if self.base_instructions_override.is_none() {
+            let mut extras = Vec::new();
+            if model.needs_special_apply_patch_instructions && !is_apply_patch_tool_present {
+                extras.push(APPLY_PATCH_TOOL_INSTRUCTIONS);
+            }
+            if is_web_search_tool_present {
+                extras.push(WEB_SEARCH_TOOL_INSTRUCTIONS);
+            }
+            if !extras.is_empty() {
+                let mut combined = String::from(base);
+                for extra in extras {
+                    combined.push('\n');
+                    combined.push_str(extra);
+                }
+                return Cow::Owned(combined);
+            }
         }
+        Cow::Borrowed(base)
     }
 
     pub(crate) fn get_formatted_input(&self) -> Vec<ResponseItem> {
@@ -193,10 +209,6 @@ pub(crate) mod tools {
         Function(ResponsesApiTool),
         #[serde(rename = "local_shell")]
         LocalShell {},
-        // TODO: Understand why we get an error on web_search although the API docs say it's supported.
-        // https://platform.openai.com/docs/guides/tools-web-search?api-mode=responses#:~:text=%7B%20type%3A%20%22web_search%22%20%7D%2C
-        #[serde(rename = "web_search")]
-        WebSearch {},
         #[serde(rename = "custom")]
         Freeform(FreeformTool),
     }
@@ -206,7 +218,6 @@ pub(crate) mod tools {
             match self {
                 ToolSpec::Function(tool) => tool.name.as_str(),
                 ToolSpec::LocalShell {} => "local_shell",
-                ToolSpec::WebSearch {} => "web_search",
                 ToolSpec::Freeform(tool) => tool.name.as_str(),
             }
         }
