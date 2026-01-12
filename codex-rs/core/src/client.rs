@@ -246,7 +246,15 @@ impl ModelClient {
         };
 
         let text = create_text_param_for_request(verbosity, &prompt.output_schema);
-        let api_prompt = build_api_prompt(prompt, instructions.clone(), tools_json);
+        let mut input = prompt.get_formatted_input();
+        remove_web_search_calls(&mut input);
+        let api_prompt = ApiPrompt {
+            instructions: instructions.clone(),
+            input,
+            tools: tools_json,
+            parallel_tool_calls: prompt.parallel_tool_calls,
+            output_schema: prompt.output_schema.clone(),
+        };
         let conversation_id = self.conversation_id.to_string();
         let session_source = self.session_source.clone();
 
@@ -372,9 +380,11 @@ impl ModelClient {
         let instructions = prompt
             .get_full_instructions(&self.get_model_info())
             .into_owned();
+        let mut input = prompt.input.clone();
+        remove_web_search_calls(&mut input);
         let payload = ApiCompactionInput {
             model: &self.get_model(),
-            input: &prompt.input,
+            input: &input,
             instructions: &instructions,
         };
 
@@ -426,6 +436,10 @@ fn build_api_prompt(prompt: &Prompt, instructions: String, tools_json: Vec<Value
         parallel_tool_calls: prompt.parallel_tool_calls,
         output_schema: prompt.output_schema.clone(),
     }
+}
+
+fn remove_web_search_calls(input: &mut Vec<ResponseItem>) {
+    input.retain(|item| !matches!(item, ResponseItem::WebSearchCall { .. }));
 }
 
 fn beta_feature_headers(config: &Config) -> ApiHeaderMap {
