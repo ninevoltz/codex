@@ -268,6 +268,11 @@ pub struct Config {
     /// auto (default): keyring if available, otherwise file.
     pub mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode,
 
+    /// Optional fixed port to use for the local HTTP callback server used during MCP OAuth login.
+    ///
+    /// When unset, Codex will bind to an ephemeral port chosen by the OS.
+    pub mcp_oauth_callback_port: Option<u16>,
+
     /// Combined provider map (defaults merged with user-defined overrides).
     pub model_providers: HashMap<String, ModelProviderInfo>,
 
@@ -759,6 +764,10 @@ pub struct ConfigToml {
     /// auto (default): Use the OS-specific keyring service if available, otherwise use a file.
     #[serde(default)]
     pub mcp_oauth_credentials_store: Option<OAuthCredentialsStoreMode>,
+
+    /// Optional fixed port for the local HTTP callback server used during MCP OAuth login.
+    /// When unset, Codex will bind to an ephemeral port chosen by the OS.
+    pub mcp_oauth_callback_port: Option<u16>,
 
     /// User-defined provider entries that extend/override the built-in list.
     #[serde(default)]
@@ -1379,6 +1388,7 @@ impl Config {
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.
             mcp_oauth_credentials_store_mode: cfg.mcp_oauth_credentials_store.unwrap_or_default(),
+            mcp_oauth_callback_port: cfg.mcp_oauth_callback_port,
             model_providers,
             tavily_api_key,
             project_doc_max_bytes: cfg.project_doc_max_bytes.unwrap_or(PROJECT_DOC_MAX_BYTES),
@@ -3264,6 +3274,7 @@ model_verbosity = "high"
                 cli_auth_credentials_store_mode: Default::default(),
                 mcp_servers: HashMap::new(),
                 mcp_oauth_credentials_store_mode: Default::default(),
+                mcp_oauth_callback_port: None,
                 model_providers: fixture.model_provider_map.clone(),
                 tavily_api_key: None,
                 project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
@@ -3351,6 +3362,7 @@ model_verbosity = "high"
             cli_auth_credentials_store_mode: Default::default(),
             mcp_servers: HashMap::new(),
             mcp_oauth_credentials_store_mode: Default::default(),
+            mcp_oauth_callback_port: None,
             model_providers: fixture.model_provider_map.clone(),
             tavily_api_key: None,
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
@@ -3453,6 +3465,7 @@ model_verbosity = "high"
             cli_auth_credentials_store_mode: Default::default(),
             mcp_servers: HashMap::new(),
             mcp_oauth_credentials_store_mode: Default::default(),
+            mcp_oauth_callback_port: None,
             model_providers: fixture.model_provider_map.clone(),
             tavily_api_key: None,
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
@@ -3541,6 +3554,7 @@ model_verbosity = "high"
             cli_auth_credentials_store_mode: Default::default(),
             mcp_servers: HashMap::new(),
             mcp_oauth_credentials_store_mode: Default::default(),
+            mcp_oauth_callback_port: None,
             model_providers: fixture.model_provider_map.clone(),
             tavily_api_key: None,
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
@@ -3853,6 +3867,34 @@ trust_level = "untrusted"
             Some("test-profile".to_string()),
         );
         assert_eq!(result, Some("explicit-provider".to_string()));
+    }
+
+    #[test]
+    fn config_toml_deserializes_mcp_oauth_callback_port() {
+        let toml = r#"mcp_oauth_callback_port = 4321"#;
+        let cfg: ConfigToml =
+            toml::from_str(toml).expect("TOML deserialization should succeed for callback port");
+        assert_eq!(cfg.mcp_oauth_callback_port, Some(4321));
+    }
+
+    #[test]
+    fn config_loads_mcp_oauth_callback_port_from_toml() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let toml = r#"
+model = "gpt-5.1"
+mcp_oauth_callback_port = 5678
+"#;
+        let cfg: ConfigToml =
+            toml::from_str(toml).expect("TOML deserialization should succeed for callback port");
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.mcp_oauth_callback_port, Some(5678));
+        Ok(())
     }
 
     #[test]
