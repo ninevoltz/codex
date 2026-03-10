@@ -4,39 +4,40 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::bash::extract_bash_command;
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::exec_env::create_env;
-use crate::protocol::BackgroundEventEvent;
-use crate::protocol::EventMsg;
+use crate::exec_policy::ExecApprovalRequest;
 use crate::protocol::ExecCommandSource;
-use crate::sandboxing::ExecEnv;
-use crate::sandboxing::SandboxPermissions;
+use crate::sandboxing::ExecRequest;
+use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventStage;
+use crate::tools::network_approval::DeferredNetworkApproval;
+use crate::tools::network_approval::finish_deferred_network_approval;
 use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::runtimes::unified_exec::UnifiedExecRequest as UnifiedExecToolRequest;
 use crate::tools::runtimes::unified_exec::UnifiedExecRuntime;
 use crate::tools::sandboxing::ToolCtx;
-use crate::truncate::TruncationPolicy;
 use crate::truncate::approx_token_count;
-use crate::truncate::formatted_truncate_text;
 use crate::unified_exec::ExecCommandRequest;
 use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
+use crate::unified_exec::MAX_YIELD_TIME_MS;
+use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
+use crate::unified_exec::MIN_YIELD_TIME_MS;
 use crate::unified_exec::ProcessEntry;
 use crate::unified_exec::ProcessStore;
 use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
-use crate::unified_exec::UnifiedExecResponse;
 use crate::unified_exec::WARNING_UNIFIED_EXEC_PROCESSES;
 use crate::unified_exec::WriteStdinRequest;
 use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
@@ -47,10 +48,10 @@ use crate::unified_exec::generate_chunk_id;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use crate::unified_exec::process::OutputBuffer;
 use crate::unified_exec::process::OutputHandles;
+use crate::unified_exec::process::SpawnLifecycleHandle;
 use crate::unified_exec::process::UnifiedExecProcess;
-use crate::unified_exec::resolve_max_tokens;
 
-const UNIFIED_EXEC_ENV: [(&str, &str); 9] = [
+const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
     ("NO_COLOR", "1"),
     ("TERM", "dumb"),
     ("LANG", "C.UTF-8"),
@@ -60,7 +61,26 @@ const UNIFIED_EXEC_ENV: [(&str, &str); 9] = [
     ("PAGER", "cat"),
     ("GIT_PAGER", "cat"),
     ("GH_PAGER", "cat"),
+    ("CODEX_CI", "1"),
 ];
+
+/// Test-only override for deterministic unified exec process IDs.
+///
+/// In production builds this value should remain at its default (`false`) and
+/// must not be toggled.
+static FORCE_DETERMINISTIC_PROCESS_IDS: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn set_deterministic_process_ids_for_tests(enabled: bool) {
+    FORCE_DETERMINISTIC_PROCESS_IDS.store(enabled, Ordering::Relaxed);
+}
+
+fn deterministic_process_ids_forced_for_tests() -> bool {
+    FORCE_DETERMINISTIC_PROCESS_IDS.load(Ordering::Relaxed)
+}
+
+fn should_use_deterministic_process_ids() -> bool {
+    cfg!(test) || deterministic_process_ids_forced_for_tests()
+}
 
 fn apply_unified_exec_env(mut env: HashMap<String, String>) -> HashMap<String, String> {
     for (key, value) in UNIFIED_EXEC_ENV {
@@ -73,11 +93,13 @@ struct PreparedProcessHandles {
     writer_tx: mpsc::Sender<Vec<u8>>,
     output_buffer: OutputBuffer,
     output_notify: Arc<Notify>,
+    output_closed: Arc<AtomicBool>,
+    output_closed_notify: Arc<Notify>,
     cancellation_token: CancellationToken,
-    session_ref: Arc<Session>,
-    turn_ref: Arc<TurnContext>,
+    pause_state: Option<watch::Receiver<bool>>,
     command: Vec<String>,
     process_id: String,
+    tty: bool,
 }
 
 impl UnifiedExecProcessManager {
@@ -85,10 +107,7 @@ impl UnifiedExecProcessManager {
         loop {
             let mut store = self.process_store.lock().await;
 
-            let process_id = if !cfg!(test) && !cfg!(feature = "deterministic_process_ids") {
-                // production mode → random
-                rand::rng().random_range(1_000..100_000).to_string()
-            } else {
+            let process_id = if should_use_deterministic_process_ids() {
                 // test or deterministic mode
                 let next = store
                     .reserved_process_ids
@@ -99,6 +118,9 @@ impl UnifiedExecProcessManager {
                     .unwrap_or(1000);
 
                 next.to_string()
+            } else {
+                // production mode → random
+                rand::rng().random_range(1_000..100_000).to_string()
             };
 
             if store.reserved_process_ids.contains(&process_id) {
@@ -111,32 +133,44 @@ impl UnifiedExecProcessManager {
     }
 
     pub(crate) async fn release_process_id(&self, process_id: &str) {
-        let mut store = self.process_store.lock().await;
-        store.remove(process_id);
+        let removed = {
+            let mut store = self.process_store.lock().await;
+            store.remove(process_id)
+        };
+        if let Some(entry) = removed {
+            Self::unregister_network_approval_for_entry(&entry).await;
+        }
+    }
+
+    async fn unregister_network_approval_for_entry(entry: &ProcessEntry) {
+        if let Some(network_approval_id) = entry.network_approval_id.as_deref()
+            && let Some(session) = entry.session.upgrade()
+        {
+            session
+                .services
+                .network_approval
+                .unregister_call(network_approval_id)
+                .await;
+        }
     }
 
     pub(crate) async fn exec_command(
         &self,
         request: ExecCommandRequest,
         context: &UnifiedExecContext,
-    ) -> Result<UnifiedExecResponse, UnifiedExecError> {
+    ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let cwd = request
             .workdir
             .clone()
             .unwrap_or_else(|| context.turn.cwd.clone());
-
         let process = self
-            .open_session_with_sandbox(
-                &request.command,
-                cwd.clone(),
-                request.sandbox_permissions,
-                request.justification,
-                context,
-            )
+            .open_session_with_sandbox(&request, cwd.clone(), context)
             .await;
 
-        let process = match process {
-            Ok(process) => Arc::new(process),
+        let (process, mut deferred_network_approval) = match process {
+            Ok((process, deferred_network_approval)) => {
+                (Arc::new(process), deferred_network_approval)
+            }
             Err(err) => {
                 self.release_process_id(&request.process_id).await;
                 return Err(err);
@@ -159,8 +193,6 @@ impl UnifiedExecProcessManager {
         emitter.emit(event_ctx, ToolEventStage::Begin).await;
 
         start_streaming_output(&process, context, Arc::clone(&transcript));
-
-        let max_tokens = resolve_max_tokens(request.max_output_tokens);
         let yield_time_ms = clamp_yield_time(request.yield_time_ms);
 
         let start = Instant::now();
@@ -170,24 +202,33 @@ impl UnifiedExecProcessManager {
         let OutputHandles {
             output_buffer,
             output_notify,
+            output_closed,
+            output_closed_notify,
             cancellation_token,
         } = process.output_handles();
         let deadline = start + Duration::from_millis(yield_time_ms);
         let collected = Self::collect_output_until_deadline(
             &output_buffer,
             &output_notify,
+            &output_closed,
+            &output_closed_notify,
             &cancellation_token,
+            Some(
+                context
+                    .session
+                    .subscribe_out_of_band_elicitation_pause_state(),
+            ),
             deadline,
         )
         .await;
         let wall_time = Instant::now().saturating_duration_since(start);
 
         let text = String::from_utf8_lossy(&collected).to_string();
-        let output = formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens));
         let exit_code = process.exit_code();
         let has_exited = process.has_exited() || exit_code.is_some();
         let chunk_id = generate_chunk_id();
         let process_id = request.process_id.clone();
+
         if has_exited {
             // Short‑lived command: emit ExecCommandEnd immediately using the
             // same helper as the background watcher, so all end events share
@@ -198,22 +239,30 @@ impl UnifiedExecProcessManager {
                 Arc::clone(&context.turn),
                 context.call_id.clone(),
                 request.command.clone(),
-                cwd,
+                cwd.clone(),
                 Some(process_id),
                 Arc::clone(&transcript),
-                output.clone(),
+                text.clone(),
                 exit,
                 wall_time,
             )
             .await;
 
             self.release_process_id(&request.process_id).await;
+            finish_deferred_network_approval(
+                context.session.as_ref(),
+                deferred_network_approval.take(),
+            )
+            .await;
             process.check_for_sandbox_denial_with_text(&text).await?;
         } else {
             // Long‑lived command: persist the process so write_stdin can reuse
             // it, and register a background watcher that will emit
             // ExecCommandEnd when the PTY eventually exits (even if no further
             // tool calls are made).
+            let network_approval_id = deferred_network_approval
+                .as_ref()
+                .map(|deferred| deferred.registration_id().to_string());
             self.store_process(
                 Arc::clone(&process),
                 context,
@@ -221,20 +270,20 @@ impl UnifiedExecProcessManager {
                 cwd.clone(),
                 start,
                 process_id,
+                request.tty,
+                network_approval_id,
                 Arc::clone(&transcript),
             )
             .await;
-
-            Self::emit_waiting_status(&context.session, &context.turn, &request.command).await;
         };
 
         let original_token_count = approx_token_count(&text);
-        let response = UnifiedExecResponse {
+        let response = ExecCommandToolOutput {
             event_call_id: context.call_id.clone(),
             chunk_id,
             wall_time,
-            output,
             raw_output: collected,
+            max_output_tokens: request.max_output_tokens,
             process_id: if has_exited {
                 None
             } else {
@@ -251,43 +300,58 @@ impl UnifiedExecProcessManager {
     pub(crate) async fn write_stdin(
         &self,
         request: WriteStdinRequest<'_>,
-    ) -> Result<UnifiedExecResponse, UnifiedExecError> {
+    ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let process_id = request.process_id.to_string();
 
         let PreparedProcessHandles {
             writer_tx,
             output_buffer,
             output_notify,
+            output_closed,
+            output_closed_notify,
             cancellation_token,
-            session_ref,
-            turn_ref,
+            pause_state,
             command: session_command,
             process_id,
+            tty,
             ..
         } = self.prepare_process_handles(process_id.as_str()).await?;
 
         if !request.input.is_empty() {
+            if !tty {
+                return Err(UnifiedExecError::StdinClosed);
+            }
             Self::send_input(&writer_tx, request.input.as_bytes()).await?;
             // Give the remote process a brief window to react so that we are
             // more likely to capture its output in the poll below.
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        let max_tokens = resolve_max_tokens(request.max_output_tokens);
-        let yield_time_ms = clamp_yield_time(request.yield_time_ms);
+        let yield_time_ms = {
+            // Empty polls use configurable background timeout bounds. Non-empty
+            // writes keep a fixed max cap so interactive stdin remains responsive.
+            let time_ms = request.yield_time_ms.max(MIN_YIELD_TIME_MS);
+            if request.input.is_empty() {
+                time_ms.clamp(MIN_EMPTY_YIELD_TIME_MS, self.max_write_stdin_yield_time_ms)
+            } else {
+                time_ms.min(MAX_YIELD_TIME_MS)
+            }
+        };
         let start = Instant::now();
         let deadline = start + Duration::from_millis(yield_time_ms);
         let collected = Self::collect_output_until_deadline(
             &output_buffer,
             &output_notify,
+            &output_closed,
+            &output_closed_notify,
             &cancellation_token,
+            pause_state,
             deadline,
         )
         .await;
         let wall_time = Instant::now().saturating_duration_since(start);
 
         let text = String::from_utf8_lossy(&collected).to_string();
-        let output = formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens));
         let original_token_count = approx_token_count(&text);
         let chunk_id = generate_chunk_id();
 
@@ -313,49 +377,51 @@ impl UnifiedExecProcessManager {
             }
         };
 
-        let response = UnifiedExecResponse {
+        let response = ExecCommandToolOutput {
             event_call_id,
             chunk_id,
             wall_time,
-            output,
             raw_output: collected,
+            max_output_tokens: request.max_output_tokens,
             process_id,
             exit_code,
             original_token_count: Some(original_token_count),
             session_command: Some(session_command.clone()),
         };
 
-        if response.process_id.is_some() {
-            Self::emit_waiting_status(&session_ref, &turn_ref, &session_command).await;
-        }
-
         Ok(response)
     }
 
     async fn refresh_process_state(&self, process_id: &str) -> ProcessStatus {
-        let mut store = self.process_store.lock().await;
-        let Some(entry) = store.processes.get(process_id) else {
-            return ProcessStatus::Unknown;
-        };
-
-        let exit_code = entry.process.exit_code();
-        let process_id = entry.process_id.clone();
-
-        if entry.process.has_exited() {
-            let Some(entry) = store.remove(&process_id) else {
+        let status = {
+            let mut store = self.process_store.lock().await;
+            let Some(entry) = store.processes.get(process_id) else {
                 return ProcessStatus::Unknown;
             };
-            ProcessStatus::Exited {
-                exit_code,
-                entry: Box::new(entry),
+
+            let exit_code = entry.process.exit_code();
+            let process_id = entry.process_id.clone();
+
+            if entry.process.has_exited() {
+                let Some(entry) = store.remove(&process_id) else {
+                    return ProcessStatus::Unknown;
+                };
+                ProcessStatus::Exited {
+                    exit_code,
+                    entry: Box::new(entry),
+                }
+            } else {
+                ProcessStatus::Alive {
+                    exit_code,
+                    call_id: entry.call_id.clone(),
+                    process_id,
+                }
             }
-        } else {
-            ProcessStatus::Alive {
-                exit_code,
-                call_id: entry.call_id.clone(),
-                process_id,
-            }
+        };
+        if let ProcessStatus::Exited { entry, .. } = &status {
+            Self::unregister_network_approval_for_entry(entry).await;
         }
+        status
     }
 
     async fn prepare_process_handles(
@@ -374,18 +440,26 @@ impl UnifiedExecProcessManager {
         let OutputHandles {
             output_buffer,
             output_notify,
+            output_closed,
+            output_closed_notify,
             cancellation_token,
         } = entry.process.output_handles();
+        let pause_state = entry
+            .session
+            .upgrade()
+            .map(|session| session.subscribe_out_of_band_elicitation_pause_state());
 
         Ok(PreparedProcessHandles {
             writer_tx: entry.process.writer_sender(),
             output_buffer,
             output_notify,
+            output_closed,
+            output_closed_notify,
             cancellation_token,
-            session_ref: Arc::clone(&entry.session_ref),
-            turn_ref: Arc::clone(&entry.turn_ref),
+            pause_state,
             command: entry.command.clone(),
             process_id: entry.process_id.clone(),
+            tty: entry.tty,
         })
     }
 
@@ -408,23 +482,32 @@ impl UnifiedExecProcessManager {
         cwd: PathBuf,
         started_at: Instant,
         process_id: String,
+        tty: bool,
+        network_approval_id: Option<String>,
         transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
     ) {
         let entry = ProcessEntry {
             process: Arc::clone(&process),
-            session_ref: Arc::clone(&context.session),
-            turn_ref: Arc::clone(&context.turn),
             call_id: context.call_id.clone(),
             process_id: process_id.clone(),
             command: command.to_vec(),
+            tty,
+            network_approval_id,
+            session: Arc::downgrade(&context.session),
             last_used: started_at,
         };
-        let number_processes = {
+        let (number_processes, pruned_entry) = {
             let mut store = self.process_store.lock().await;
-            Self::prune_processes_if_needed(&mut store);
+            let pruned_entry = Self::prune_processes_if_needed(&mut store);
             store.processes.insert(process_id.clone(), entry);
-            store.processes.len()
+            (store.processes.len(), pruned_entry)
         };
+        // prune_processes_if_needed runs while holding process_store; do async
+        // network-approval cleanup only after dropping that lock.
+        if let Some(pruned_entry) = pruned_entry {
+            Self::unregister_network_approval_for_entry(&pruned_entry).await;
+            pruned_entry.process.terminate();
+        }
 
         if number_processes >= WARNING_UNIFIED_EXEC_PROCESSES {
             context
@@ -443,87 +526,93 @@ impl UnifiedExecProcessManager {
             context.call_id.clone(),
             command.to_vec(),
             cwd,
-            process_id,
+            process_id.clone(),
             transcript,
             started_at,
         );
     }
 
-    async fn emit_waiting_status(
-        session: &Arc<Session>,
-        turn: &Arc<TurnContext>,
-        command: &[String],
-    ) {
-        let command_display = if let Some((_, script)) = extract_bash_command(command) {
-            script.to_string()
-        } else {
-            command.join(" ")
-        };
-        let message = format!("Waiting for `{command_display}`");
-        session
-            .send_event(
-                turn.as_ref(),
-                EventMsg::BackgroundEvent(BackgroundEventEvent { message }),
-            )
-            .await;
-    }
-
     pub(crate) async fn open_session_with_exec_env(
         &self,
-        env: &ExecEnv,
+        env: &ExecRequest,
+        tty: bool,
+        mut spawn_lifecycle: SpawnLifecycleHandle,
     ) -> Result<UnifiedExecProcess, UnifiedExecError> {
         let (program, args) = env
             .command
             .split_first()
             .ok_or(UnifiedExecError::MissingCommandLine)?;
 
-        let spawned = codex_utils_pty::spawn_pty_process(
-            program,
-            args,
-            env.cwd.as_path(),
-            &env.env,
-            &env.arg0,
-        )
-        .await
-        .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
-        UnifiedExecProcess::from_spawned(spawned, env.sandbox).await
+        let spawn_result = if tty {
+            codex_utils_pty::pty::spawn_process(
+                program,
+                args,
+                env.cwd.as_path(),
+                &env.env,
+                &env.arg0,
+                codex_utils_pty::TerminalSize::default(),
+            )
+            .await
+        } else {
+            codex_utils_pty::pipe::spawn_process_no_stdin(
+                program,
+                args,
+                env.cwd.as_path(),
+                &env.env,
+                &env.arg0,
+            )
+            .await
+        };
+        let spawned =
+            spawn_result.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
+        spawn_lifecycle.after_spawn();
+        UnifiedExecProcess::from_spawned(spawned, env.sandbox, spawn_lifecycle).await
     }
 
     pub(super) async fn open_session_with_sandbox(
         &self,
-        command: &[String],
+        request: &ExecCommandRequest,
         cwd: PathBuf,
-        sandbox_permissions: SandboxPermissions,
-        justification: Option<String>,
         context: &UnifiedExecContext,
-    ) -> Result<UnifiedExecProcess, UnifiedExecError> {
-        let env = apply_unified_exec_env(create_env(&context.turn.shell_environment_policy));
-        let features = context.session.features();
+    ) -> Result<(UnifiedExecProcess, Option<DeferredNetworkApproval>), UnifiedExecError> {
+        let env = apply_unified_exec_env(create_env(
+            &context.turn.shell_environment_policy,
+            Some(context.session.conversation_id),
+        ));
         let mut orchestrator = ToolOrchestrator::new();
-        let mut runtime = UnifiedExecRuntime::new(self);
+        let mut runtime =
+            UnifiedExecRuntime::new(self, context.turn.tools_config.unified_exec_backend);
         let exec_approval_requirement = context
             .session
             .services
             .exec_policy
-            .create_exec_approval_requirement_for_command(
-                &features,
-                command,
-                context.turn.approval_policy,
-                &context.turn.sandbox_policy,
-                sandbox_permissions,
-            )
+            .create_exec_approval_requirement_for_command(ExecApprovalRequest {
+                command: &request.command,
+                approval_policy: context.turn.approval_policy.value(),
+                sandbox_policy: context.turn.sandbox_policy.get(),
+                sandbox_permissions: if request.additional_permissions_preapproved {
+                    crate::sandboxing::SandboxPermissions::UseDefault
+                } else {
+                    request.sandbox_permissions
+                },
+                prefix_rule: request.prefix_rule.clone(),
+            })
             .await;
-        let req = UnifiedExecToolRequest::new(
-            command.to_vec(),
+        let req = UnifiedExecToolRequest {
+            command: request.command.clone(),
             cwd,
             env,
-            sandbox_permissions,
-            justification,
+            explicit_env_overrides: context.turn.shell_environment_policy.r#set.clone(),
+            network: request.network.clone(),
+            tty: request.tty,
+            sandbox_permissions: request.sandbox_permissions,
+            additional_permissions: request.additional_permissions.clone(),
+            justification: request.justification.clone(),
             exec_approval_requirement,
-        );
+        };
         let tool_ctx = ToolCtx {
-            session: context.session.as_ref(),
-            turn: context.turn.as_ref(),
+            session: context.session.clone(),
+            turn: context.turn.clone(),
             call_id: context.call_id.clone(),
             tool_name: "exec_command".to_string(),
         };
@@ -532,24 +621,35 @@ impl UnifiedExecProcessManager {
                 &mut runtime,
                 &req,
                 &tool_ctx,
-                context.turn.as_ref(),
-                context.turn.approval_policy,
+                &context.turn,
+                context.turn.approval_policy.value(),
             )
             .await
+            .map(|result| (result.output, result.deferred_network_approval))
             .map_err(|e| UnifiedExecError::create_process(format!("{e:?}")))
     }
 
     pub(super) async fn collect_output_until_deadline(
         output_buffer: &OutputBuffer,
         output_notify: &Arc<Notify>,
+        output_closed: &Arc<AtomicBool>,
+        output_closed_notify: &Arc<Notify>,
         cancellation_token: &CancellationToken,
-        deadline: Instant,
+        mut pause_state: Option<watch::Receiver<bool>>,
+        mut deadline: Instant,
     ) -> Vec<u8> {
-        const POST_EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(50);
+        const POST_EXIT_CLOSE_WAIT_CAP: Duration = Duration::from_millis(50);
 
         let mut collected: Vec<u8> = Vec::with_capacity(4096);
         let mut exit_signal_received = cancellation_token.is_cancelled();
+        let mut post_exit_deadline: Option<Instant> = None;
         loop {
+            Self::extend_deadlines_while_paused(
+                &mut pause_state,
+                &mut deadline,
+                &mut post_exit_deadline,
+            )
+            .await;
             let drained_chunks: Vec<Vec<u8>>;
             let mut wait_for_output = None;
             {
@@ -562,20 +662,37 @@ impl UnifiedExecProcessManager {
 
             if drained_chunks.is_empty() {
                 exit_signal_received |= cancellation_token.is_cancelled();
+                if exit_signal_received && output_closed.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    break;
+                }
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining == Duration::ZERO {
                     break;
                 }
 
-                let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
                 if exit_signal_received {
-                    let grace = remaining.min(POST_EXIT_OUTPUT_GRACE);
-                    if tokio::time::timeout(grace, notified).await.is_err() {
+                    let now = Instant::now();
+                    let close_wait_deadline = *post_exit_deadline
+                        .get_or_insert_with(|| now + remaining.min(POST_EXIT_CLOSE_WAIT_CAP));
+                    let close_wait_remaining = close_wait_deadline.saturating_duration_since(now);
+                    if close_wait_remaining == Duration::ZERO {
                         break;
+                    }
+                    let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
+                    let closed = output_closed_notify.notified();
+                    tokio::pin!(notified);
+                    tokio::pin!(closed);
+                    tokio::select! {
+                        _ = &mut notified => {}
+                        _ = &mut closed => {}
+                        _ = tokio::time::sleep(close_wait_remaining) => break,
+                        _ = Self::wait_for_pause_change(pause_state.as_ref()) => {}
                     }
                     continue;
                 }
 
+                let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
                 tokio::pin!(notified);
                 let exit_notified = cancellation_token.cancelled();
                 tokio::pin!(exit_notified);
@@ -583,6 +700,7 @@ impl UnifiedExecProcessManager {
                     _ = &mut notified => {}
                     _ = &mut exit_notified => exit_signal_received = true,
                     _ = tokio::time::sleep(remaining) => break,
+                    _ = Self::wait_for_pause_change(pause_state.as_ref()) => {}
                 }
                 continue;
             }
@@ -600,9 +718,45 @@ impl UnifiedExecProcessManager {
         collected
     }
 
-    fn prune_processes_if_needed(store: &mut ProcessStore) -> bool {
+    async fn extend_deadlines_while_paused(
+        pause_state: &mut Option<watch::Receiver<bool>>,
+        deadline: &mut Instant,
+        post_exit_deadline: &mut Option<Instant>,
+    ) {
+        let Some(receiver) = pause_state.as_mut() else {
+            return;
+        };
+        if !*receiver.borrow() {
+            return;
+        }
+
+        let paused_at = Instant::now();
+        while *receiver.borrow() {
+            if receiver.changed().await.is_err() {
+                break;
+            }
+        }
+
+        let paused_for = paused_at.elapsed();
+        *deadline += paused_for;
+        if let Some(post_exit_deadline) = post_exit_deadline.as_mut() {
+            *post_exit_deadline += paused_for;
+        }
+    }
+
+    async fn wait_for_pause_change(pause_state: Option<&watch::Receiver<bool>>) {
+        match pause_state {
+            Some(pause_state) => {
+                let mut receiver = pause_state.clone();
+                let _ = receiver.changed().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    fn prune_processes_if_needed(store: &mut ProcessStore) -> Option<ProcessEntry> {
         if store.processes.len() < MAX_UNIFIED_EXEC_PROCESSES {
-            return false;
+            return None;
         }
 
         let meta: Vec<(String, Instant, bool)> = store
@@ -612,13 +766,10 @@ impl UnifiedExecProcessManager {
             .collect();
 
         if let Some(process_id) = Self::process_id_to_prune_from_meta(&meta) {
-            if let Some(entry) = store.remove(&process_id) {
-                entry.process.terminate();
-            }
-            return true;
+            return store.remove(&process_id);
         }
 
-        false
+        None
     }
 
     // Centralized pruning policy so we can easily swap strategies later.
@@ -663,6 +814,7 @@ impl UnifiedExecProcessManager {
         };
 
         for entry in entries {
+            Self::unregister_network_approval_for_entry(&entry).await;
             entry.process.terminate();
         }
     }
@@ -701,6 +853,7 @@ mod tests {
             ("PAGER".to_string(), "cat".to_string()),
             ("GIT_PAGER".to_string(), "cat".to_string()),
             ("GH_PAGER".to_string(), "cat".to_string()),
+            ("CODEX_CI".to_string(), "1".to_string()),
         ]);
 
         assert_eq!(env, expected);

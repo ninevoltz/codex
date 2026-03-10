@@ -1,8 +1,10 @@
 use crate::client_common::tools::ToolSpec;
+use crate::config::types::Personality;
 use crate::error::Result;
 pub use codex_api::common::ResponseEvent;
+use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::openai_models::ModelInfo;
 use futures::Stream;
 use serde::Deserialize;
 use serde_json::Value;
@@ -35,32 +37,30 @@ pub struct Prompt {
     /// Whether parallel tool calls are permitted for this prompt.
     pub(crate) parallel_tool_calls: bool,
 
-    /// Optional override for the built-in BASE_INSTRUCTIONS.
-    pub base_instructions_override: Option<String>,
+    pub base_instructions: BaseInstructions,
+
+    /// Optionally specify the personality of the model.
+    pub personality: Option<Personality>,
 
     /// Optional the output schema for the model's response.
     pub output_schema: Option<Value>,
 }
 
 impl Prompt {
-    pub(crate) fn get_full_instructions<'a>(&'a self, model: &'a ModelInfo) -> Cow<'a, str> {
-        let base = self
-            .base_instructions_override
-            .as_deref()
-            .unwrap_or(model.base_instructions.as_str());
+    pub(crate) fn get_full_instructions(&self) -> Cow<'_, str> {
         let is_web_search_tool_present = self.tools.iter().any(|tool| match tool {
             ToolSpec::Function(f) => f.name == "web_search",
             ToolSpec::Freeform(f) => f.name == "web_search",
             ToolSpec::WebSearch { .. } => true,
             _ => false,
         });
-        if self.base_instructions_override.is_none() && is_web_search_tool_present {
-            let mut combined = String::from(base);
+        if is_web_search_tool_present {
+            let mut combined = self.base_instructions.text.clone();
             combined.push('\n');
             combined.push_str(WEB_SEARCH_TOOL_INSTRUCTIONS);
             Cow::Owned(combined)
         } else {
-            Cow::Borrowed(base)
+            Cow::Borrowed(self.base_instructions.text.as_str())
         }
     }
 
@@ -103,23 +103,19 @@ fn reserialize_shell_outputs(items: &mut [ResponseItem]) {
                 shell_call_ids.insert(call_id.clone());
             }
         }
-        ResponseItem::CustomToolCallOutput { call_id, output } => {
-            if shell_call_ids.remove(call_id)
-                && let Some(structured) = parse_structured_shell_output(output)
-            {
-                *output = structured
-            }
-        }
         ResponseItem::FunctionCall { name, call_id, .. }
             if is_shell_tool_name(name) || name == "apply_patch" =>
         {
             shell_call_ids.insert(call_id.clone());
         }
-        ResponseItem::FunctionCallOutput { call_id, output } => {
+        ResponseItem::FunctionCallOutput { call_id, output }
+        | ResponseItem::CustomToolCallOutput { call_id, output } => {
             if shell_call_ids.remove(call_id)
-                && let Some(structured) = parse_structured_shell_output(&output.content)
+                && let Some(structured) = output
+                    .text_content()
+                    .and_then(parse_structured_shell_output)
             {
-                output.content = structured
+                output.body = FunctionCallOutputBody::Text(structured);
             }
         }
         _ => {}
@@ -177,8 +173,13 @@ fn strip_total_output_header(output: &str) -> Option<(&str, u32)> {
 
 pub(crate) mod tools {
     use crate::tools::spec::JsonSchema;
+    use codex_protocol::config_types::WebSearchContextSize;
+    use codex_protocol::config_types::WebSearchFilters as ConfigWebSearchFilters;
+    use codex_protocol::config_types::WebSearchUserLocation as ConfigWebSearchUserLocation;
+    use codex_protocol::config_types::WebSearchUserLocationType;
     use serde::Deserialize;
     use serde::Serialize;
+    use serde_json::Value;
 
     /// When serialized as JSON, this produces a valid "Tool" in the OpenAI
     /// Responses API.
@@ -189,6 +190,8 @@ pub(crate) mod tools {
         Function(ResponsesApiTool),
         #[serde(rename = "local_shell")]
         LocalShell {},
+        #[serde(rename = "image_generation")]
+        ImageGeneration { output_format: String },
         // TODO: Understand why we get an error on web_search although the API docs say it's supported.
         // https://platform.openai.com/docs/guides/tools-web-search?api-mode=responses#:~:text=%7B%20type%3A%20%22web_search%22%20%7D%2C
         // The `external_web_access` field determines whether the web search is over cached or live content.
@@ -197,6 +200,14 @@ pub(crate) mod tools {
         WebSearch {
             #[serde(skip_serializing_if = "Option::is_none")]
             external_web_access: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            filters: Option<ResponsesApiWebSearchFilters>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            user_location: Option<ResponsesApiWebSearchUserLocation>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            search_context_size: Option<WebSearchContextSize>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            search_content_types: Option<Vec<String>>,
         },
         #[serde(rename = "custom")]
         Freeform(FreeformTool),
@@ -207,8 +218,49 @@ pub(crate) mod tools {
             match self {
                 ToolSpec::Function(tool) => tool.name.as_str(),
                 ToolSpec::LocalShell {} => "local_shell",
+                ToolSpec::ImageGeneration { .. } => "image_generation",
                 ToolSpec::WebSearch { .. } => "web_search",
                 ToolSpec::Freeform(tool) => tool.name.as_str(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, PartialEq)]
+    pub(crate) struct ResponsesApiWebSearchFilters {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) allowed_domains: Option<Vec<String>>,
+    }
+
+    impl From<ConfigWebSearchFilters> for ResponsesApiWebSearchFilters {
+        fn from(filters: ConfigWebSearchFilters) -> Self {
+            Self {
+                allowed_domains: filters.allowed_domains,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, PartialEq)]
+    pub(crate) struct ResponsesApiWebSearchUserLocation {
+        #[serde(rename = "type")]
+        pub(crate) r#type: WebSearchUserLocationType,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) country: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) region: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) city: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) timezone: Option<String>,
+    }
+
+    impl From<ConfigWebSearchUserLocation> for ResponsesApiWebSearchUserLocation {
+        fn from(user_location: ConfigWebSearchUserLocation) -> Self {
+            Self {
+                r#type: user_location.r#type,
+                country: user_location.country,
+                region: user_location.region,
+                city: user_location.city,
+                timezone: user_location.timezone,
             }
         }
     }
@@ -236,6 +288,8 @@ pub(crate) mod tools {
         /// `properties` must be present in `required`.
         pub(crate) strict: bool,
         pub(crate) parameters: JsonSchema,
+        #[serde(skip)]
+        pub(crate) output_schema: Option<Value>,
     }
 }
 
@@ -257,94 +311,29 @@ mod tests {
     use codex_api::common::OpenAiVerbosity;
     use codex_api::common::TextControls;
     use codex_api::create_text_param_for_request;
+    use codex_protocol::config_types::ServiceTier;
+    use codex_protocol::models::FunctionCallOutputPayload;
     use pretty_assertions::assert_eq;
 
-    use crate::config::test_config;
-    use crate::models_manager::manager::ModelsManager;
-
     use super::*;
-
-    struct InstructionsTestCase {
-        pub slug: &'static str,
-        pub expects_apply_patch_instructions: bool,
-    }
-    #[test]
-    fn get_full_instructions_no_user_content() {
-        let prompt = Prompt {
-            ..Default::default()
-        };
-        let prompt_with_apply_patch_instructions =
-            include_str!("../prompt_with_apply_patch_instructions.md");
-        let test_cases = vec![
-            InstructionsTestCase {
-                slug: "gpt-3.5",
-                expects_apply_patch_instructions: true,
-            },
-            InstructionsTestCase {
-                slug: "gpt-4.1",
-                expects_apply_patch_instructions: true,
-            },
-            InstructionsTestCase {
-                slug: "gpt-4o",
-                expects_apply_patch_instructions: true,
-            },
-            InstructionsTestCase {
-                slug: "gpt-5",
-                expects_apply_patch_instructions: true,
-            },
-            InstructionsTestCase {
-                slug: "gpt-5.1",
-                expects_apply_patch_instructions: false,
-            },
-            InstructionsTestCase {
-                slug: "codex-mini-latest",
-                expects_apply_patch_instructions: true,
-            },
-            InstructionsTestCase {
-                slug: "gpt-oss:120b",
-                expects_apply_patch_instructions: false,
-            },
-            InstructionsTestCase {
-                slug: "gpt-5.1-codex",
-                expects_apply_patch_instructions: false,
-            },
-            InstructionsTestCase {
-                slug: "gpt-5.1-codex-max",
-                expects_apply_patch_instructions: false,
-            },
-        ];
-        for test_case in test_cases {
-            let config = test_config();
-            let model_info = ModelsManager::construct_model_info_offline(test_case.slug, &config);
-            if test_case.expects_apply_patch_instructions {
-                assert_eq!(
-                    model_info.base_instructions.as_str(),
-                    prompt_with_apply_patch_instructions
-                );
-            }
-
-            let expected = model_info.base_instructions.as_str();
-            let full = prompt.get_full_instructions(&model_info);
-            assert_eq!(full, expected);
-        }
-    }
 
     #[test]
     fn serializes_text_verbosity_when_set() {
         let input: Vec<ResponseItem> = vec![];
         let tools: Vec<serde_json::Value> = vec![];
         let req = ResponsesApiRequest {
-            model: "gpt-5.1",
-            instructions: "i",
-            input: &input,
-            tools: &tools,
-            tool_choice: "auto",
+            model: "gpt-5.1".to_string(),
+            instructions: "i".to_string(),
+            input,
+            tools,
+            tool_choice: "auto".to_string(),
             parallel_tool_calls: true,
             reasoning: None,
             store: false,
             stream: true,
             include: vec![],
             prompt_cache_key: None,
+            service_tier: None,
             text: Some(TextControls {
                 verbosity: Some(OpenAiVerbosity::Low),
                 format: None,
@@ -375,17 +364,18 @@ mod tests {
             create_text_param_for_request(None, &Some(schema.clone())).expect("text controls");
 
         let req = ResponsesApiRequest {
-            model: "gpt-5.1",
-            instructions: "i",
-            input: &input,
-            tools: &tools,
-            tool_choice: "auto",
+            model: "gpt-5.1".to_string(),
+            instructions: "i".to_string(),
+            input,
+            tools,
+            tool_choice: "auto".to_string(),
             parallel_tool_calls: true,
             reasoning: None,
             store: false,
             stream: true,
             include: vec![],
             prompt_cache_key: None,
+            service_tier: None,
             text: Some(text_controls),
         };
 
@@ -411,21 +401,105 @@ mod tests {
         let input: Vec<ResponseItem> = vec![];
         let tools: Vec<serde_json::Value> = vec![];
         let req = ResponsesApiRequest {
-            model: "gpt-5.1",
-            instructions: "i",
-            input: &input,
-            tools: &tools,
-            tool_choice: "auto",
+            model: "gpt-5.1".to_string(),
+            instructions: "i".to_string(),
+            input,
+            tools,
+            tool_choice: "auto".to_string(),
             parallel_tool_calls: true,
             reasoning: None,
             store: false,
             stream: true,
             include: vec![],
             prompt_cache_key: None,
+            service_tier: None,
             text: None,
         };
 
         let v = serde_json::to_value(&req).expect("json");
         assert!(v.get("text").is_none());
+    }
+
+    #[test]
+    fn serializes_flex_service_tier_when_set() {
+        let req = ResponsesApiRequest {
+            model: "gpt-5.1".to_string(),
+            instructions: "i".to_string(),
+            input: vec![],
+            tools: vec![],
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: true,
+            reasoning: None,
+            store: false,
+            stream: true,
+            include: vec![],
+            prompt_cache_key: None,
+            service_tier: Some(ServiceTier::Flex.to_string()),
+            text: None,
+        };
+
+        let v = serde_json::to_value(&req).expect("json");
+        assert_eq!(
+            v.get("service_tier").and_then(|tier| tier.as_str()),
+            Some("flex")
+        );
+    }
+
+    #[test]
+    fn reserializes_shell_outputs_for_function_and_custom_tool_calls() {
+        let raw_output = r#"{"output":"hello","metadata":{"exit_code":0,"duration_seconds":0.5}}"#;
+        let expected_output = "Exit code: 0\nWall time: 0.5 seconds\nOutput:\nhello";
+        let mut items = vec![
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                arguments: "{}".to_string(),
+                call_id: "call-1".to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload::from_text(raw_output.to_string()),
+            },
+            ResponseItem::CustomToolCall {
+                id: None,
+                status: None,
+                call_id: "call-2".to_string(),
+                name: "apply_patch".to_string(),
+                input: "*** Begin Patch".to_string(),
+            },
+            ResponseItem::CustomToolCallOutput {
+                call_id: "call-2".to_string(),
+                output: FunctionCallOutputPayload::from_text(raw_output.to_string()),
+            },
+        ];
+
+        reserialize_shell_outputs(&mut items);
+
+        assert_eq!(
+            items,
+            vec![
+                ResponseItem::FunctionCall {
+                    id: None,
+                    name: "shell".to_string(),
+                    arguments: "{}".to_string(),
+                    call_id: "call-1".to_string(),
+                },
+                ResponseItem::FunctionCallOutput {
+                    call_id: "call-1".to_string(),
+                    output: FunctionCallOutputPayload::from_text(expected_output.to_string()),
+                },
+                ResponseItem::CustomToolCall {
+                    id: None,
+                    status: None,
+                    call_id: "call-2".to_string(),
+                    name: "apply_patch".to_string(),
+                    input: "*** Begin Patch".to_string(),
+                },
+                ResponseItem::CustomToolCallOutput {
+                    call_id: "call-2".to_string(),
+                    output: FunctionCallOutputPayload::from_text(expected_output.to_string()),
+                },
+            ]
+        );
     }
 }

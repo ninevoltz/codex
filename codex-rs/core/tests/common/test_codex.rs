@@ -3,6 +3,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
 use anyhow::Result;
 use codex_core::CodexAuth;
 use codex_core::CodexThread;
@@ -11,26 +12,33 @@ use codex_core::ThreadManager;
 use codex_core::built_in_model_providers;
 use codex_core::config::Config;
 use codex_core::features::Feature;
-use codex_core::protocol::AskForApproval;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::Op;
-use codex_core::protocol::SandboxPolicy;
-use codex_core::protocol::SessionConfiguredEvent;
-use codex_protocol::config_types::ReasoningSummary;
+use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
+use codex_protocol::config_types::ServiceTier;
+use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::SessionConfiguredEvent;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
 use serde_json::Value;
 use tempfile::TempDir;
 use wiremock::MockServer;
 
 use crate::load_default_config_for_test;
+use crate::responses::WebSocketTestServer;
+use crate::responses::output_value_to_text;
 use crate::responses::start_mock_server;
 use crate::streaming_sse::StreamingSseServer;
 use crate::wait_for_event;
+use crate::wait_for_event_match;
 use wiremock::Match;
 use wiremock::matchers::path_regex;
 
 type ConfigMutator = dyn FnOnce(&mut Config) + Send;
 type PreBuildHook = dyn FnOnce(&Path) + Send + 'static;
+const TEST_MODEL_WITH_EXPERIMENTAL_TOOLS: &str = "test-gpt-5.1-codex";
 
 /// A collection of different ways the model can output an apply_patch call
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -55,6 +63,7 @@ pub struct TestCodexBuilder {
     config_mutators: Vec<Box<ConfigMutator>>,
     auth: CodexAuth,
     pre_build_hooks: Vec<Box<PreBuildHook>>,
+    home: Option<Arc<TempDir>>,
 }
 
 impl TestCodexBuilder {
@@ -86,9 +95,17 @@ impl TestCodexBuilder {
         self
     }
 
+    pub fn with_home(mut self, home: Arc<TempDir>) -> Self {
+        self.home = Some(home);
+        self
+    }
+
     pub async fn build(&mut self, server: &wiremock::MockServer) -> anyhow::Result<TestCodex> {
-        let home = Arc::new(TempDir::new()?);
-        self.build_with_home(server, home, None).await
+        let home = match self.home.clone() {
+            Some(home) => home,
+            None => Arc::new(TempDir::new()?),
+        };
+        Box::pin(self.build_with_home(server, home, None)).await
     }
 
     pub async fn build_with_streaming_server(
@@ -96,9 +113,32 @@ impl TestCodexBuilder {
         server: &StreamingSseServer,
     ) -> anyhow::Result<TestCodex> {
         let base_url = server.uri();
-        let home = Arc::new(TempDir::new()?);
-        self.build_with_home_and_base_url(format!("{base_url}/v1"), home, None)
-            .await
+        let home = match self.home.clone() {
+            Some(home) => home,
+            None => Arc::new(TempDir::new()?),
+        };
+        Box::pin(self.build_with_home_and_base_url(format!("{base_url}/v1"), home, None)).await
+    }
+
+    pub async fn build_with_websocket_server(
+        &mut self,
+        server: &WebSocketTestServer,
+    ) -> anyhow::Result<TestCodex> {
+        let base_url = format!("{}/v1", server.uri());
+        let home = match self.home.clone() {
+            Some(home) => home,
+            None => Arc::new(TempDir::new()?),
+        };
+        let base_url_clone = base_url.clone();
+        self.config_mutators.push(Box::new(move |config| {
+            config.model_provider.base_url = Some(base_url_clone);
+            config.experimental_realtime_ws_model = Some("realtime-test-model".to_string());
+            config
+                .features
+                .enable(Feature::ResponsesWebsockets)
+                .expect("test config should allow feature update");
+        }));
+        Box::pin(self.build_with_home_and_base_url(base_url, home, None)).await
     }
 
     pub async fn resume(
@@ -107,7 +147,7 @@ impl TestCodexBuilder {
         home: Arc<TempDir>,
         rollout_path: PathBuf,
     ) -> anyhow::Result<TestCodex> {
-        self.build_with_home(server, home, Some(rollout_path)).await
+        Box::pin(self.build_with_home(server, home, Some(rollout_path))).await
     }
 
     async fn build_with_home(
@@ -118,7 +158,7 @@ impl TestCodexBuilder {
     ) -> anyhow::Result<TestCodex> {
         let base_url = format!("{}/v1", server.uri());
         let (config, cwd) = self.prepare_config(base_url, &home).await?;
-        self.build_from_config(config, cwd, home, resume_from).await
+        Box::pin(self.build_from_config(config, cwd, home, resume_from)).await
     }
 
     async fn build_with_home_and_base_url(
@@ -128,7 +168,7 @@ impl TestCodexBuilder {
         resume_from: Option<PathBuf>,
     ) -> anyhow::Result<TestCodex> {
         let (config, cwd) = self.prepare_config(base_url, &home).await?;
-        self.build_from_config(config, cwd, home, resume_from).await
+        Box::pin(self.build_from_config(config, cwd, home, resume_from)).await
     }
 
     async fn build_from_config(
@@ -139,21 +179,33 @@ impl TestCodexBuilder {
         resume_from: Option<PathBuf>,
     ) -> anyhow::Result<TestCodex> {
         let auth = self.auth.clone();
-        let thread_manager = ThreadManager::with_models_provider_and_home(
-            auth.clone(),
-            config.model_provider.clone(),
-            config.codex_home.clone(),
-        );
+        let thread_manager = if config.model_catalog.is_some() {
+            ThreadManager::new(
+                &config,
+                codex_core::test_support::auth_manager_from_auth(auth.clone()),
+                SessionSource::Exec,
+                CollaborationModesConfig::default(),
+            )
+        } else {
+            codex_core::test_support::thread_manager_with_models_provider_and_home(
+                auth.clone(),
+                config.model_provider.clone(),
+                config.codex_home.clone(),
+            )
+        };
         let thread_manager = Arc::new(thread_manager);
 
         let new_conversation = match resume_from {
             Some(path) => {
-                let auth_manager = codex_core::AuthManager::from_auth_for_testing(auth);
-                thread_manager
-                    .resume_thread_from_rollout(config.clone(), path, auth_manager)
-                    .await?
+                let auth_manager = codex_core::test_support::auth_manager_from_auth(auth);
+                Box::pin(thread_manager.resume_thread_from_rollout(
+                    config.clone(),
+                    path,
+                    auth_manager,
+                ))
+                .await?
             }
-            None => thread_manager.start_thread(config.clone()).await?,
+            None => Box::pin(thread_manager.start_thread(config.clone())).await?,
         };
 
         Ok(TestCodex {
@@ -184,6 +236,14 @@ impl TestCodexBuilder {
         }
         if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codex") {
             config.codex_linux_sandbox_exe = Some(path);
+        } else if let Ok(exe) = std::env::current_exe()
+            && let Some(path) = exe
+                .parent()
+                .and_then(|parent| parent.parent())
+                .map(|parent| parent.join("codex"))
+            && path.is_file()
+        {
+            config.codex_linux_sandbox_exe = Some(path);
         }
 
         let mut mutators = vec![];
@@ -191,15 +251,54 @@ impl TestCodexBuilder {
         for mutator in mutators {
             mutator(&mut config);
         }
+        ensure_test_model_catalog(&mut config)?;
 
         if config.include_apply_patch_tool {
-            config.features.enable(Feature::ApplyPatchFreeform);
+            config.features.enable(Feature::ApplyPatchFreeform)?;
         } else {
-            config.features.disable(Feature::ApplyPatchFreeform);
+            config.features.disable(Feature::ApplyPatchFreeform)?;
         }
 
         Ok((config, cwd))
     }
+}
+
+fn ensure_test_model_catalog(config: &mut Config) -> Result<()> {
+    if config.model.as_deref() != Some(TEST_MODEL_WITH_EXPERIMENTAL_TOOLS)
+        || config.model_catalog.is_some()
+    {
+        return Ok(());
+    }
+
+    let bundled_models_path = codex_utils_cargo_bin::find_resource!("../../models.json")
+        .context("bundled models.json")?;
+    let bundled_models_contents =
+        std::fs::read_to_string(&bundled_models_path).with_context(|| {
+            format!(
+                "read bundled models.json from {}",
+                bundled_models_path.display()
+            )
+        })?;
+    let bundled_models: ModelsResponse =
+        serde_json::from_str(&bundled_models_contents).context("parse bundled models.json")?;
+    let mut model = bundled_models
+        .models
+        .iter()
+        .find(|candidate| candidate.slug == "gpt-5.1-codex")
+        .cloned()
+        .unwrap_or_else(|| panic!("missing bundled model gpt-5.1-codex"));
+    model.slug = TEST_MODEL_WITH_EXPERIMENTAL_TOOLS.to_string();
+    model.display_name = TEST_MODEL_WITH_EXPERIMENTAL_TOOLS.to_string();
+    model.experimental_supported_tools = vec![
+        "test_sync_tool".to_string(),
+        "read_file".to_string(),
+        "grep_files".to_string(),
+        "list_dir".to_string(),
+    ];
+    config.model_catalog = Some(ModelsResponse {
+        models: vec![model],
+    });
+    Ok(())
 }
 
 pub struct TestCodex {
@@ -242,17 +341,43 @@ impl TestCodex {
             .await
     }
 
+    pub async fn submit_turn_with_service_tier(
+        &self,
+        prompt: &str,
+        service_tier: Option<ServiceTier>,
+    ) -> Result<()> {
+        self.submit_turn_with_context(
+            prompt,
+            AskForApproval::Never,
+            SandboxPolicy::DangerFullAccess,
+            Some(service_tier),
+        )
+        .await
+    }
+
     pub async fn submit_turn_with_policies(
         &self,
         prompt: &str,
         approval_policy: AskForApproval,
         sandbox_policy: SandboxPolicy,
     ) -> Result<()> {
+        self.submit_turn_with_context(prompt, approval_policy, sandbox_policy, None)
+            .await
+    }
+
+    async fn submit_turn_with_context(
+        &self,
+        prompt: &str,
+        approval_policy: AskForApproval,
+        sandbox_policy: SandboxPolicy,
+        service_tier: Option<Option<ServiceTier>>,
+    ) -> Result<()> {
         let session_model = self.session_configured.model.clone();
         self.codex
             .submit(Op::UserTurn {
                 items: vec![UserInput::Text {
                     text: prompt.into(),
+                    text_elements: Vec::new(),
                 }],
                 final_output_json_schema: None,
                 cwd: self.cwd.path().to_path_buf(),
@@ -260,12 +385,21 @@ impl TestCodex {
                 sandbox_policy,
                 model: session_model,
                 effort: None,
-                summary: ReasoningSummary::Auto,
+                summary: None,
+                service_tier,
+                collaboration_mode: None,
+                personality: None,
             })
             .await?;
 
-        wait_for_event(&self.codex, |event| {
-            matches!(event, EventMsg::TurnComplete(_))
+        let turn_id = wait_for_event_match(&self.codex, |event| match event {
+            EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+            _ => None,
+        })
+        .await;
+        wait_for_event(&self.codex, |event| match event {
+            EventMsg::TurnComplete(event) => event.turn_id == turn_id,
+            _ => false,
         })
         .await;
         Ok(())
@@ -353,11 +487,7 @@ impl TestCodexHarness {
 
     pub async fn custom_tool_call_output(&self, call_id: &str) -> String {
         let bodies = self.request_bodies().await;
-        custom_tool_call_output(&bodies, call_id)
-            .get("output")
-            .and_then(Value::as_str)
-            .expect("output string")
-            .to_string()
+        custom_tool_call_output_text(&bodies, call_id)
     }
 
     pub async fn apply_patch_output(
@@ -392,6 +522,14 @@ fn custom_tool_call_output<'a>(bodies: &'a [Value], call_id: &str) -> &'a Value 
     panic!("custom_tool_call_output {call_id} not found");
 }
 
+fn custom_tool_call_output_text(bodies: &[Value], call_id: &str) -> String {
+    let output = custom_tool_call_output(bodies, call_id)
+        .get("output")
+        .unwrap_or_else(|| panic!("custom_tool_call_output {call_id} missing output"));
+    output_value_to_text(output)
+        .unwrap_or_else(|| panic!("custom_tool_call_output {call_id} missing text output"))
+}
+
 fn function_call_output<'a>(bodies: &'a [Value], call_id: &str) -> &'a Value {
     for body in bodies {
         if let Some(items) = body.get("input").and_then(Value::as_array) {
@@ -412,5 +550,39 @@ pub fn test_codex() -> TestCodexBuilder {
         config_mutators: vec![],
         auth: CodexAuth::from_api_key("dummy"),
         pre_build_hooks: vec![],
+        home: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    #[test]
+    fn custom_tool_call_output_text_returns_output_text() {
+        let bodies = vec![json!({
+            "input": [{
+                "type": "custom_tool_call_output",
+                "call_id": "call-1",
+                "output": "hello"
+            }]
+        })];
+
+        assert_eq!(custom_tool_call_output_text(&bodies, "call-1"), "hello");
+    }
+
+    #[test]
+    #[should_panic(expected = "custom_tool_call_output call-2 missing output")]
+    fn custom_tool_call_output_text_panics_when_output_is_missing() {
+        let bodies = vec![json!({
+            "input": [{
+                "type": "custom_tool_call_output",
+                "call_id": "call-2"
+            }]
+        })];
+
+        let _ = custom_tool_call_output_text(&bodies, "call-2");
     }
 }

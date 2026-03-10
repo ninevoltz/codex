@@ -4,7 +4,7 @@
 //! - Manages interactive processes (create, reuse, buffer output with caps).
 //! - Uses the shared ToolOrchestrator to handle approval, sandbox selection, and
 //!   retry semantics in a single, descriptive flow.
-//! - Spawns the PTY from a sandbox‑transformed `ExecEnv`; on sandbox denial,
+//! - Spawns the PTY from a sandbox-transformed `ExecRequest`; on sandbox denial,
 //!   retries without sandbox when policy allows (no re‑prompt thanks to caching).
 //! - Uses the shared `is_likely_sandbox_denied` heuristic to keep denial messages
 //!   consistent with other exec paths.
@@ -12,7 +12,7 @@
 //! Flow at a glance (open process)
 //! 1) Build a small request `{ command, cwd }`.
 //! 2) Orchestrator: approval (bypass/cache/prompt) → select sandbox → run.
-//! 3) Runtime: transform `CommandSpec` → `ExecEnv` → spawn PTY.
+//! 3) Runtime: transform `CommandSpec` -> `ExecRequest` -> spawn PTY.
 //! 4) If denial, orchestrator retries with `SandboxType::None`.
 //! 5) Process handle is returned with streaming output + metadata.
 //!
@@ -25,8 +25,10 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::Weak;
 
+use codex_network_proxy::NetworkProxy;
+use codex_protocol::models::PermissionProfile;
 use rand::Rng;
 use rand::rng;
 use tokio::sync::Mutex;
@@ -41,11 +43,22 @@ mod head_tail_buffer;
 mod process;
 mod process_manager;
 
+pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
+    process_manager::set_deterministic_process_ids_for_tests(enabled);
+}
+
 pub(crate) use errors::UnifiedExecError;
+pub(crate) use process::NoopSpawnLifecycle;
+#[cfg(unix)]
+pub(crate) use process::SpawnLifecycle;
+pub(crate) use process::SpawnLifecycleHandle;
 pub(crate) use process::UnifiedExecProcess;
 
 pub(crate) const MIN_YIELD_TIME_MS: u64 = 250;
+// Minimum yield time for an empty `write_stdin`.
+pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
 pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
+pub(crate) const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 300_000;
 pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_TOKENS: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
@@ -77,8 +90,13 @@ pub(crate) struct ExecCommandRequest {
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
     pub workdir: Option<PathBuf>,
+    pub network: Option<NetworkProxy>,
+    pub tty: bool,
     pub sandbox_permissions: SandboxPermissions,
+    pub additional_permissions: Option<PermissionProfile>,
+    pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
+    pub prefix_rule: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -87,20 +105,6 @@ pub(crate) struct WriteStdinRequest<'a> {
     pub input: &'a str,
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct UnifiedExecResponse {
-    pub event_call_id: String,
-    pub chunk_id: String,
-    pub wall_time: Duration,
-    pub output: String,
-    /// Raw bytes returned for this unified exec call before any truncation.
-    pub raw_output: Vec<u8>,
-    pub process_id: Option<String>,
-    pub exit_code: Option<i32>,
-    pub original_token_count: Option<usize>,
-    pub session_command: Option<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -118,23 +122,33 @@ impl ProcessStore {
 
 pub(crate) struct UnifiedExecProcessManager {
     process_store: Mutex<ProcessStore>,
+    max_write_stdin_yield_time_ms: u64,
+}
+
+impl UnifiedExecProcessManager {
+    pub(crate) fn new(max_write_stdin_yield_time_ms: u64) -> Self {
+        Self {
+            process_store: Mutex::new(ProcessStore::default()),
+            max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
+                .max(MIN_EMPTY_YIELD_TIME_MS),
+        }
+    }
 }
 
 impl Default for UnifiedExecProcessManager {
     fn default() -> Self {
-        Self {
-            process_store: Mutex::new(ProcessStore::default()),
-        }
+        Self::new(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
     }
 }
 
 struct ProcessEntry {
     process: Arc<UnifiedExecProcess>,
-    session_ref: Arc<Session>,
-    turn_ref: Arc<TurnContext>,
     call_id: String,
     process_id: String,
     command: Vec<String>,
+    tty: bool,
+    network_approval_id: Option<String>,
+    session: Weak<Session>,
     last_used: tokio::time::Instant,
 }
 
@@ -163,6 +177,7 @@ mod tests {
     use crate::codex::make_session_and_context;
     use crate::protocol::AskForApproval;
     use crate::protocol::SandboxPolicy;
+    use crate::tools::context::ExecCommandToolOutput;
     use crate::unified_exec::ExecCommandRequest;
     use crate::unified_exec::WriteStdinRequest;
     use core_test_support::skip_if_sandbox;
@@ -171,8 +186,16 @@ mod tests {
 
     async fn test_session_and_turn() -> (Arc<Session>, Arc<TurnContext>) {
         let (session, mut turn) = make_session_and_context().await;
-        turn.approval_policy = AskForApproval::Never;
-        turn.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        turn.approval_policy
+            .set(AskForApproval::Never)
+            .expect("test setup should allow updating approval policy");
+        turn.sandbox_policy
+            .set(SandboxPolicy::DangerFullAccess)
+            .expect("test setup should allow updating sandbox policy");
+        turn.file_system_sandbox_policy =
+            codex_protocol::permissions::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
+        turn.network_sandbox_policy =
+            codex_protocol::permissions::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
         (Arc::new(session), Arc::new(turn))
     }
 
@@ -181,7 +204,7 @@ mod tests {
         turn: &Arc<TurnContext>,
         cmd: &str,
         yield_time_ms: u64,
-    ) -> Result<UnifiedExecResponse, UnifiedExecError> {
+    ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let context =
             UnifiedExecContext::new(Arc::clone(session), Arc::clone(turn), "call".to_string());
         let process_id = session
@@ -200,8 +223,13 @@ mod tests {
                     yield_time_ms,
                     max_output_tokens: None,
                     workdir: None,
+                    network: None,
+                    tty: true,
                     sandbox_permissions: SandboxPermissions::UseDefault,
+                    additional_permissions: None,
+                    additional_permissions_preapproved: false,
                     justification: None,
+                    prefix_rule: None,
                 },
                 &context,
             )
@@ -213,7 +241,7 @@ mod tests {
         process_id: &str,
         input: &str,
         yield_time_ms: u64,
-    ) -> Result<UnifiedExecResponse, UnifiedExecError> {
+    ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         session
             .services
             .unified_exec_manager
@@ -288,7 +316,7 @@ mod tests {
         )
         .await?;
         assert!(
-            out_2.output.contains("codex"),
+            out_2.truncated_output().contains("codex"),
             "expected environment variable output"
         );
 
@@ -324,7 +352,7 @@ mod tests {
             "short command should not report a process id if it exits quickly"
         );
         assert!(
-            !out_2.output.contains("codex"),
+            !out_2.truncated_output().contains("codex"),
             "short command should run in a fresh shell"
         );
 
@@ -340,7 +368,7 @@ mod tests {
         )
         .await?;
         assert!(
-            out_3.output.contains("codex"),
+            out_3.truncated_output().contains("codex"),
             "session should preserve state"
         );
 
@@ -350,6 +378,8 @@ mod tests {
     #[tokio::test]
     async fn unified_exec_timeouts() -> anyhow::Result<()> {
         skip_if_sandbox!(Ok(()));
+
+        const TEST_VAR_VALUE: &str = "unified_exec_var_123";
 
         let (session, turn) = test_session_and_turn().await;
 
@@ -363,7 +393,7 @@ mod tests {
         write_stdin(
             &session,
             process_id,
-            "export CODEX_INTERACTIVE_SHELL_VAR=codex\n",
+            format!("export CODEX_INTERACTIVE_SHELL_VAR={TEST_VAR_VALUE}\n").as_str(),
             2_500,
         )
         .await?;
@@ -376,7 +406,7 @@ mod tests {
         )
         .await?;
         assert!(
-            !out_2.output.contains("codex"),
+            !out_2.truncated_output().contains(TEST_VAR_VALUE),
             "timeout too short should yield incomplete output"
         );
 
@@ -385,8 +415,41 @@ mod tests {
         let out_3 = write_stdin(&session, process_id, "", 100).await?;
 
         assert!(
-            out_3.output.contains("codex"),
+            out_3.truncated_output().contains(TEST_VAR_VALUE),
             "subsequent poll should retrieve output"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unified_exec_pause_blocks_yield_timeout() -> anyhow::Result<()> {
+        skip_if_sandbox!(Ok(()));
+
+        let (session, turn) = test_session_and_turn().await;
+        session.set_out_of_band_elicitation_pause_state(true);
+
+        let paused_session = Arc::clone(&session);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            paused_session.set_out_of_band_elicitation_pause_state(false);
+        });
+
+        let started = tokio::time::Instant::now();
+        let response =
+            exec_command(&session, &turn, "sleep 1 && echo unified-exec-done", 250).await?;
+
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "pause should block the unified exec yield timeout"
+        );
+        assert!(
+            response.truncated_output().contains("unified-exec-done"),
+            "exec_command should wait for output after the pause lifts"
+        );
+        assert!(
+            response.process_id.is_none(),
+            "completed command should not leave a background process"
         );
 
         Ok(())
@@ -400,7 +463,7 @@ mod tests {
         let result = exec_command(&session, &turn, "echo codex", 120_000).await?;
 
         assert!(result.process_id.is_some());
-        assert!(result.output.contains("codex"));
+        assert!(result.truncated_output().contains("codex"));
 
         Ok(())
     }
@@ -415,7 +478,7 @@ mod tests {
             result.process_id.is_some(),
             "completed command should report a process id"
         );
-        assert!(result.output.contains("codex"));
+        assert!(result.truncated_output().contains("codex"));
 
         assert!(
             session

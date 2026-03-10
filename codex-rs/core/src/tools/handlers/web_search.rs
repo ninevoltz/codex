@@ -5,8 +5,8 @@ use serde_json::json;
 use crate::function_tool::FunctionCallError;
 use crate::tavily::TavilyRequest;
 use crate::tavily::search_tavily;
+use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
@@ -28,11 +28,13 @@ fn default_limit() -> usize {
 
 #[async_trait]
 impl ToolHandler for WebSearchHandler {
+    type Output = FunctionToolOutput;
+
     fn kind(&self) -> ToolKind {
         ToolKind::Function
     }
 
-    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
+    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
         let ToolInvocation { payload, turn, .. } = invocation;
 
         let arguments = match payload {
@@ -56,7 +58,7 @@ impl ToolHandler for WebSearchHandler {
             ));
         }
 
-        let config = turn.client.config();
+        let config = turn.config.as_ref();
         let api_key = match config
             .tavily_api_key
             .as_deref()
@@ -92,10 +94,6 @@ impl ToolHandler for WebSearchHandler {
             ))
         })?;
 
-        Ok(ToolOutput::Function {
-            content,
-            content_items: None,
-            success: Some(true),
-        })
+        Ok(FunctionToolOutput::from_text(content, Some(true)))
     }
 }

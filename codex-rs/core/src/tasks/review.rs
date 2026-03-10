@@ -1,21 +1,26 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::AgentMessageDeltaEvent;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ReviewOutputEvent;
+use codex_protocol::protocol::SubAgentSource;
 use tokio_util::sync::CancellationToken;
 
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::codex_delegate::run_codex_thread_one_shot;
+use crate::config::Constrained;
+use crate::features::Feature;
 use crate::review_format::format_review_findings_block;
 use crate::review_format::render_review_output_text;
 use crate::state::TaskKind;
@@ -39,6 +44,10 @@ impl SessionTask for ReviewTask {
         TaskKind::Review
     }
 
+    fn span_name(&self) -> &'static str {
+        "session_task.review"
+    }
+
     async fn run(
         self: Arc<Self>,
         session: Arc<SessionTaskContext>,
@@ -49,7 +58,7 @@ impl SessionTask for ReviewTask {
         let _ = session
             .session
             .services
-            .otel_manager
+            .session_telemetry
             .counter("codex.task.review", 1, &[]);
 
         // Start sub-codex conversation and get the receiver for events.
@@ -81,18 +90,27 @@ async fn start_review_conversation(
     input: Vec<UserInput>,
     cancellation_token: CancellationToken,
 ) -> Option<async_channel::Receiver<Event>> {
-    let config = ctx.client.config();
+    let config = ctx.config.clone();
     let mut sub_agent_config = config.as_ref().clone();
     // Carry over review-only feature restrictions so the delegate cannot
-    // re-enable blocked tools (web search, view image).
-    sub_agent_config
-        .features
-        .disable(crate::features::Feature::WebSearchRequest);
+    // re-enable blocked tools (web search, collab tools, view image).
+    if let Err(err) = sub_agent_config
+        .web_search_mode
+        .set(WebSearchMode::Disabled)
+    {
+        panic!("by construction Constrained<WebSearchMode> must always support Disabled: {err}");
+    }
+    let _ = sub_agent_config.features.disable(Feature::Collab);
 
     // Set explicit review rubric for the sub-agent
     sub_agent_config.base_instructions = Some(crate::REVIEW_PROMPT.to_string());
+    sub_agent_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
 
-    sub_agent_config.model = Some(config.review_model.clone());
+    let model = config
+        .review_model
+        .clone()
+        .unwrap_or_else(|| ctx.model_info.slug.clone());
+    sub_agent_config.model = Some(model);
     (run_codex_thread_one_shot(
         sub_agent_config,
         session.auth_manager(),
@@ -101,6 +119,8 @@ async fn start_review_conversation(
         session.clone_session(),
         ctx.clone(),
         cancellation_token,
+        SubAgentSource::Review,
+        None,
         None,
     )
     .await)
@@ -187,8 +207,8 @@ pub(crate) async fn exit_review_mode(
     review_output: Option<ReviewOutputEvent>,
     ctx: Arc<TurnContext>,
 ) {
-    const REVIEW_USER_MESSAGE_ID: &str = "review:rollout:user";
-    const REVIEW_ASSISTANT_MESSAGE_ID: &str = "review:rollout:assistant";
+    const REVIEW_USER_MESSAGE_ID: &str = "review_rollout_user";
+    const REVIEW_ASSISTANT_MESSAGE_ID: &str = "review_rollout_assistant";
     let (user_message, assistant_message) = if let Some(out) = review_output.clone() {
         let mut findings_str = String::new();
         let text = out.overall_explanation.trim();
@@ -218,9 +238,12 @@ pub(crate) async fn exit_review_mode(
                 id: Some(REVIEW_USER_MESSAGE_ID.to_string()),
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText { text: user_message }],
+                end_turn: None,
+                phase: None,
             }],
         )
         .await;
+
     session
         .send_event(
             ctx.as_ref(),
@@ -236,7 +259,14 @@ pub(crate) async fn exit_review_mode(
                 content: vec![ContentItem::OutputText {
                     text: assistant_message,
                 }],
+                end_turn: None,
+                phase: None,
             },
         )
         .await;
+
+    // Review turns can run before any regular user turn, so explicitly
+    // materialize rollout persistence. Do this after emitting review output so
+    // file creation + git metadata collection cannot delay client-facing items.
+    session.ensure_rollout_materialized().await;
 }

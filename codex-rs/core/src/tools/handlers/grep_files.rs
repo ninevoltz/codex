@@ -7,8 +7,8 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::function_tool::FunctionCallError;
+use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
@@ -37,11 +37,13 @@ struct GrepFilesArgs {
 
 #[async_trait]
 impl ToolHandler for GrepFilesHandler {
+    type Output = FunctionToolOutput;
+
     fn kind(&self) -> ToolKind {
         ToolKind::Function
     }
 
-    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
+    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
         let ToolInvocation { payload, turn, .. } = invocation;
 
         let arguments = match payload {
@@ -85,17 +87,15 @@ impl ToolHandler for GrepFilesHandler {
             run_rg_search(pattern, include.as_deref(), &search_path, limit, &turn.cwd).await?;
 
         if search_results.is_empty() {
-            Ok(ToolOutput::Function {
-                content: "No matches found.".to_string(),
-                content_items: None,
-                success: Some(false),
-            })
+            Ok(FunctionToolOutput::from_text(
+                "No matches found.".to_string(),
+                Some(false),
+            ))
         } else {
-            Ok(ToolOutput::Function {
-                content: search_results.join("\n"),
-                content_items: None,
-                success: Some(true),
-            })
+            Ok(FunctionToolOutput::from_text(
+                search_results.join("\n"),
+                Some(true),
+            ))
         }
     }
 }

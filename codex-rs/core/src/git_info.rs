@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -25,21 +27,12 @@ use tokio::time::timeout;
 /// directory. If you need Codex to work from such a checkout simply pass the
 /// `--allow-no-git-exec` CLI flag that disables the repo requirement.
 pub fn get_git_repo_root(base_dir: &Path) -> Option<PathBuf> {
-    let mut dir = base_dir.to_path_buf();
-
-    loop {
-        if dir.join(".git").exists() {
-            return Some(dir);
-        }
-
-        // Pop one component (go up one directory).  `pop` returns false when
-        // we have reached the filesystem root.
-        if !dir.pop() {
-            break;
-        }
-    }
-
-    None
+    let base = if base_dir.is_dir() {
+        base_dir
+    } else {
+        base_dir.parent()?
+    };
+    find_ancestor_git_entry(base).map(|(repo_root, _)| repo_root)
 }
 
 /// Timeout for git commands to prevent freezing on large repositories
@@ -107,6 +100,82 @@ pub async fn collect_git_info(cwd: &Path) -> Option<GitInfo> {
     }
 
     Some(git_info)
+}
+
+/// Collect fetch remotes in a multi-root-friendly format: {"origin": "https://..."}.
+pub async fn get_git_remote_urls(cwd: &Path) -> Option<BTreeMap<String, String>> {
+    let is_git_repo = run_git_command_with_timeout(&["rev-parse", "--git-dir"], cwd)
+        .await?
+        .status
+        .success();
+    if !is_git_repo {
+        return None;
+    }
+
+    get_git_remote_urls_assume_git_repo(cwd).await
+}
+
+/// Collect fetch remotes without checking whether `cwd` is in a git repo.
+pub async fn get_git_remote_urls_assume_git_repo(cwd: &Path) -> Option<BTreeMap<String, String>> {
+    let output = run_git_command_with_timeout(&["remote", "-v"], cwd).await?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    parse_git_remote_urls(stdout.as_str())
+}
+
+/// Return the current HEAD commit hash without checking whether `cwd` is in a git repo.
+pub async fn get_head_commit_hash(cwd: &Path) -> Option<String> {
+    let output = run_git_command_with_timeout(&["rev-parse", "HEAD"], cwd).await?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let hash = stdout.trim();
+    if hash.is_empty() {
+        None
+    } else {
+        Some(hash.to_string())
+    }
+}
+
+pub async fn get_has_changes(cwd: &Path) -> Option<bool> {
+    let output = run_git_command_with_timeout(&["status", "--porcelain"], cwd).await?;
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(!output.stdout.is_empty())
+}
+
+fn parse_git_remote_urls(stdout: &str) -> Option<BTreeMap<String, String>> {
+    let mut remotes = BTreeMap::new();
+    for line in stdout.lines() {
+        let Some(fetch_line) = line.strip_suffix(" (fetch)") else {
+            continue;
+        };
+
+        let Some((name, url_part)) = fetch_line
+            .split_once('\t')
+            .or_else(|| fetch_line.split_once(' '))
+        else {
+            continue;
+        };
+
+        let url = url_part.trim_start();
+        if !url.is_empty() {
+            remotes.insert(name.to_string(), url.to_string());
+        }
+    }
+
+    if remotes.is_empty() {
+        None
+    } else {
+        Some(remotes)
+    }
 }
 
 /// A minimal commit summary entry used for pickers (subject + timestamp + sha).
@@ -185,11 +254,13 @@ pub async fn git_diff_to_remote(cwd: &Path) -> Option<GitDiffToRemote> {
 
 /// Run a git command with a timeout to prevent blocking on large repositories
 async fn run_git_command_with_timeout(args: &[&str], cwd: &Path) -> Option<std::process::Output> {
-    let result = timeout(
-        GIT_COMMAND_TIMEOUT,
-        Command::new("git").args(args).current_dir(cwd).output(),
-    )
-    .await;
+    let mut command = Command::new("git");
+    command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(args)
+        .current_dir(cwd)
+        .kill_on_drop(true);
+    let result = timeout(GIT_COMMAND_TIMEOUT, command.output()).await;
 
     match result {
         Ok(Ok(output)) => Some(output),
@@ -530,30 +601,53 @@ async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
 
 /// Resolve the path that should be used for trust checks. Similar to
 /// `[get_git_repo_root]`, but resolves to the root of the main
-/// repository. Handles worktrees.
+/// repository. Handles worktrees via filesystem inspection without invoking
+/// the `git` executable.
 pub fn resolve_root_git_project_for_trust(cwd: &Path) -> Option<PathBuf> {
     let base = if cwd.is_dir() { cwd } else { cwd.parent()? };
+    let (repo_root, dot_git) = find_ancestor_git_entry(base)?;
+    if dot_git.is_dir() {
+        return Some(canonicalize_or_raw(repo_root));
+    }
 
-    // TODO: we should make this async, but it's primarily used deep in
-    // callstacks of sync code, and should almost always be fast
-    let git_dir_out = std::process::Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
-        .current_dir(base)
-        .output()
-        .ok()?;
-    if !git_dir_out.status.success() {
+    let git_dir_s = std::fs::read_to_string(&dot_git).ok()?;
+    let git_dir_rel = git_dir_s.trim().strip_prefix("gitdir:")?.trim();
+    if git_dir_rel.is_empty() {
         return None;
     }
-    let git_dir_s = String::from_utf8(git_dir_out.stdout)
-        .ok()?
-        .trim()
-        .to_string();
 
-    let git_dir_path_raw = resolve_path(base, &PathBuf::from(&git_dir_s));
+    let git_dir_path = canonicalize_or_raw(resolve_path(&repo_root, &PathBuf::from(git_dir_rel)));
+    let worktrees_dir = git_dir_path.parent()?;
+    if worktrees_dir.file_name() != Some(OsStr::new("worktrees")) {
+        return None;
+    }
 
-    // Normalize to handle macOS /var vs /private/var and resolve ".." segments.
-    let git_dir_path = std::fs::canonicalize(&git_dir_path_raw).unwrap_or(git_dir_path_raw);
-    git_dir_path.parent().map(Path::to_path_buf)
+    let common_dir = worktrees_dir.parent()?;
+    let main_repo_root = common_dir.parent()?;
+    Some(canonicalize_or_raw(main_repo_root.to_path_buf()))
+}
+
+fn find_ancestor_git_entry(base_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut dir = base_dir.to_path_buf();
+
+    loop {
+        let dot_git = dir.join(".git");
+        if dot_git.exists() {
+            return Some((dir, dot_git));
+        }
+
+        // Pop one component (go up one directory). `pop` returns false when
+        // we have reached the filesystem root.
+        if !dir.pop() {
+            break;
+        }
+    }
+
+    None
+}
+
+fn canonicalize_or_raw(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
 }
 
 /// Returns a list of local git branches.
@@ -897,6 +991,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_has_changes_non_git_directory_returns_none() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        assert_eq!(get_has_changes(temp_dir.path()).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_get_has_changes_clean_repo_returns_false() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let repo_path = create_test_git_repo(&temp_dir).await;
+        assert_eq!(get_has_changes(&repo_path).await, Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_get_has_changes_with_tracked_change_returns_true() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let repo_path = create_test_git_repo(&temp_dir).await;
+
+        fs::write(repo_path.join("test.txt"), "updated tracked file").expect("write tracked file");
+        assert_eq!(get_has_changes(&repo_path).await, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_get_has_changes_with_untracked_change_returns_true() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let repo_path = create_test_git_repo(&temp_dir).await;
+
+        fs::write(repo_path.join("new_file.txt"), "untracked").expect("write untracked file");
+        assert_eq!(get_has_changes(&repo_path).await, Some(true));
+    }
+
+    #[tokio::test]
     async fn test_get_git_working_tree_state_clean_repo() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let (repo_path, branch) = create_test_git_repo_with_remote(&temp_dir).await;
@@ -1038,6 +1163,33 @@ mod tests {
         let got_nested =
             resolve_root_git_project_for_trust(&nested).and_then(|p| std::fs::canonicalize(p).ok());
         assert_eq!(got_nested, expected);
+    }
+
+    #[test]
+    fn resolve_root_git_project_for_trust_detects_worktree_pointer_without_git_command() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo_root = tmp.path().join("repo");
+        let common_dir = repo_root.join(".git");
+        let worktree_git_dir = common_dir.join("worktrees").join("feature-x");
+        let worktree_root = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree_git_dir).unwrap();
+        std::fs::create_dir_all(&worktree_root).unwrap();
+        std::fs::create_dir_all(worktree_root.join("nested")).unwrap();
+        std::fs::write(
+            worktree_root.join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+
+        let expected = std::fs::canonicalize(&repo_root).unwrap();
+        assert_eq!(
+            resolve_root_git_project_for_trust(&worktree_root),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            resolve_root_git_project_for_trust(&worktree_root.join("nested")),
+            Some(expected)
+        );
     }
 
     #[test]
