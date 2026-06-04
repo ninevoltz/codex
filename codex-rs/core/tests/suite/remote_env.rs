@@ -638,6 +638,116 @@ async fn apply_patch_freeform_routes_to_selected_remote_environment() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_turn_diff_tracks_local_and_remote_environment_paths() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let Some(_remote_env) = get_remote_test_env() else {
+        return Ok(());
+    };
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex();
+    let test = builder.build_with_remote_and_local_env(&server).await?;
+    let local_cwd = TempDir::new()?;
+    let file_name = "shared-turn-diff.txt";
+    let remote_cwd = PathBuf::from(format!(
+        "/tmp/codex-remote-turn-diff-{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
+    ))
+    .abs();
+    test.fs()
+        .create_directory(
+            &remote_cwd,
+            CreateDirectoryOptions { recursive: true },
+            /*sandbox*/ None,
+        )
+        .await?;
+
+    let local_patch = format!(
+        "*** Begin Patch\n*** Environment ID: {LOCAL_ENVIRONMENT_ID}\n*** Add File: {file_name}\n+local\n*** End Patch"
+    );
+    let remote_patch = format!(
+        "*** Begin Patch\n*** Environment ID: {REMOTE_ENVIRONMENT_ID}\n*** Add File: {file_name}\n+remote\n*** End Patch"
+    );
+    mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-local"),
+                ev_apply_patch_custom_tool_call("call-local", &local_patch),
+                ev_completed("resp-local"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-remote"),
+                ev_apply_patch_custom_tool_call("call-remote", &remote_patch),
+                ev_completed("resp-remote"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-done"),
+                ev_assistant_message("msg-done", "done"),
+                ev_completed("resp-done"),
+            ]),
+        ],
+    )
+    .await;
+
+    test.submit_turn_with_environments(
+        "apply matching patches to local and remote environments",
+        Some(vec![
+            TurnEnvironmentSelection {
+                environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+                cwd: local_cwd.path().abs(),
+            },
+            TurnEnvironmentSelection {
+                environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
+                cwd: remote_cwd.clone(),
+            },
+        ]),
+    )
+    .await?;
+
+    let mut last_diff = None;
+    wait_for_event(&test.codex, |event| match event {
+        EventMsg::TurnDiff(ev) => {
+            last_diff = Some(ev.unified_diff.clone());
+            false
+        }
+        EventMsg::TurnComplete(_) => true,
+        _ => false,
+    })
+    .await;
+
+    assert_eq!(
+        fs::read_to_string(local_cwd.path().join(file_name))?,
+        "local\n"
+    );
+    assert_eq!(
+        test.fs()
+            .read_file_text(&remote_cwd.join(file_name), /*sandbox*/ None)
+            .await?,
+        "remote\n"
+    );
+    let diff = last_diff.expect("expected TurnDiff event");
+    assert!(diff.contains("shared-turn-diff.txt"), "{diff}");
+    assert!(!diff.contains("local/shared-turn-diff.txt"), "{diff}");
+    assert!(!diff.contains("remote/shared-turn-diff.txt"), "{diff}");
+    assert!(diff.contains("+local\n"), "{diff}");
+    assert!(diff.contains("+remote\n"), "{diff}");
+
+    test.fs()
+        .remove(
+            &remote_cwd,
+            RemoveOptions {
+                recursive: true,
+                force: true,
+            },
+            /*sandbox*/ None,
+        )
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_approvals_are_remembered_per_environment() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let Some(_remote_env) = get_remote_test_env() else {

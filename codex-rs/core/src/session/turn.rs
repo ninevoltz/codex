@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -196,21 +197,11 @@ pub(crate) async fn run_turn(
     let mut stop_hook_active = false;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
-    #[allow(deprecated)]
-    let display_root = match turn_context.environments.primary() {
-        Some(turn_environment) => get_git_repo_root_with_fs(
-            turn_environment.environment.get_filesystem().as_ref(),
-            &turn_environment.cwd,
-        )
-        .await
-        .unwrap_or_else(|| turn_environment.cwd.clone())
-        .into_path_buf(),
-        None => get_git_repo_root(turn_context.cwd.as_path())
-            .unwrap_or_else(|| turn_context.cwd.clone().into_path_buf()),
-    };
-    let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::with_display_root(
-        display_root,
-    )));
+    let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
+        TurnDiffTracker::with_environment_display_roots(
+            turn_diff_display_roots(turn_context.as_ref()).await,
+        ),
+    ));
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
@@ -419,6 +410,28 @@ pub(crate) async fn run_turn(
     }
 
     last_agent_message
+}
+
+async fn turn_diff_display_roots(turn_context: &TurnContext) -> Vec<(String, PathBuf)> {
+    if turn_context.environments.turn_environments.is_empty() {
+        #[allow(deprecated)]
+        let display_root = get_git_repo_root(turn_context.cwd.as_path())
+            .unwrap_or_else(|| turn_context.cwd.clone().into_path_buf());
+        return vec![(String::new(), display_root)];
+    }
+
+    let mut display_roots = Vec::with_capacity(turn_context.environments.turn_environments.len());
+    for turn_environment in &turn_context.environments.turn_environments {
+        let display_root = get_git_repo_root_with_fs(
+            turn_environment.environment.get_filesystem().as_ref(),
+            &turn_environment.cwd,
+        )
+        .await
+        .unwrap_or_else(|| turn_environment.cwd.clone())
+        .into_path_buf();
+        display_roots.push((turn_environment.environment_id.clone(), display_root));
+    }
+    display_roots
 }
 
 async fn run_hooks_and_record_inputs(
